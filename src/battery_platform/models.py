@@ -8,7 +8,11 @@ FaultName = Literal[
     "under_voltage",
     "over_temperature",
     "measurement_fault",
+    "charge_contactor_feedback",
+    "discharge_contactor_feedback",
 ]
+
+ContactorName = Literal["charge", "discharge"]
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,22 @@ class Measurement:
 
 
 @dataclass(frozen=True)
+class ContactorFeedback:
+    """Observed contactor auxiliary feedback. None means the feedback is missing."""
+
+    timestamp: float
+    charge_closed: bool | None
+    discharge_closed: bool | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp,
+            "charge_closed": self.charge_closed,
+            "discharge_closed": self.discharge_closed,
+        }
+
+
+@dataclass(frozen=True)
 class ProtectionEvent:
     timestamp: float
     event_type: str
@@ -37,9 +57,11 @@ class ProtectionEvent:
     locked_reasons: tuple[str, ...] = field(default_factory=tuple)
     reasons: tuple[str, ...] = field(default_factory=tuple)
     details: dict[str, Any] = field(default_factory=dict)
+    charge_feedback_closed: bool | None = None
+    discharge_feedback_closed: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "timestamp": self.timestamp,
             "event_type": self.event_type,
             "charge_contactor_closed": self.charge_contactor_closed,
@@ -49,3 +71,6 @@ class ProtectionEvent:
             "reasons": list(self.reasons),
             "details": self.details,
         }
+        payload["charge_feedback_closed"] = self.charge_feedback_closed
+        payload["discharge_feedback_closed"] = self.discharge_feedback_closed
+        return payload

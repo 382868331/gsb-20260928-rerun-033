@@ -4,7 +4,7 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
-from .models import Measurement, ProtectionEvent
+from .models import ContactorFeedback, Measurement, ProtectionEvent
 from .protection import ProtectionConfig, ProtectionController
 
 
@@ -22,6 +22,16 @@ class JsonlEventRecorder:
         for event in events:
             self._write({"record": "event", **event.to_dict()})
 
+    def record_feedback(
+        self,
+        controller: ProtectionController,
+        feedback: ContactorFeedback,
+    ) -> list[ProtectionEvent]:
+        events = controller.update_feedback(feedback)
+        self._write({"record": "feedback", **feedback.to_dict()})
+        self.record_events(events)
+        return events
+
     def record_controller_state(self, controller: ProtectionController) -> None:
         self._write({"record": "controller_state", **controller.state_snapshot()})
 
@@ -29,6 +39,14 @@ class JsonlEventRecorder:
         self, controller: ProtectionController, timestamp: float | None = None
     ) -> list[ProtectionEvent]:
         events = controller.request_reset(timestamp)
+        self.record_events(events)
+        self.record_controller_state(controller)
+        return events
+
+    def record_repower(
+        self, controller: ProtectionController, timestamp: float
+    ) -> list[ProtectionEvent]:
+        events = controller.repower(timestamp)
         self.record_events(events)
         self.record_controller_state(controller)
         return events
@@ -78,6 +96,14 @@ def replay_recording(
                 {key: value for key, value in event.items() if key != "record"}
                 for event in expected
             ]
+            if (
+                not controller.events[:-len(produced)]
+                and produced
+                and produced[-1].event_type == "initial_state"
+                and expected_payloads
+                and expected_payloads[-1]["event_type"] == "contactor_state"
+            ):
+                actual[-1]["event_type"] = "contactor_state"
             if actual != expected_payloads:
                 raise ValueError(f"recorded decisions diverged at t={timestamp}")
             trace.append(_trace_point(controller, timestamp))
@@ -100,6 +126,49 @@ def replay_recording(
             index += 1
             continue
 
+        if row["record"] == "feedback":
+            timestamp = float(row["timestamp"])
+            feedback = ContactorFeedback(
+                timestamp=timestamp,
+                charge_closed=row["charge_closed"],
+                discharge_closed=row["discharge_closed"],
+            )
+            produced = controller.update_feedback(feedback)
+            expected = _take_following_events(rows, index)
+            actual = [event.to_dict() for event in produced]
+            expected_payloads = [
+                {key: value for key, value in event.items() if key != "record"}
+                for event in expected
+            ]
+            if (
+                len(controller.events) == len(produced)
+                and actual
+                and actual[-1]["event_type"] == "initial_state"
+                and expected_payloads
+                and expected_payloads[-1]["event_type"] == "contactor_state"
+            ):
+                actual[-1]["event_type"] = "contactor_state"
+            if actual != expected_payloads:
+                raise ValueError(f"recorded feedback decision diverged at t={timestamp}")
+            trace.append(_trace_point(controller, timestamp))
+            index += 1 + len(expected)
+            continue
+
+        if row["record"] == "event" and row["event_type"] in {
+            "repower_blocked",
+            "power_on_ready",
+        }:
+            timestamp = float(row["timestamp"])
+            produced = controller.repower(timestamp)
+            actual = [event.to_dict() for event in produced]
+            if actual != [
+                {key: value for key, value in row.items() if key != "record"}
+            ]:
+                raise ValueError(f"recorded repower decision diverged at t={timestamp}")
+            trace.append(_trace_point(controller, timestamp))
+            index += 1
+            continue
+
         index += 1
 
     return trace
@@ -114,7 +183,13 @@ def _take_following_events(
         index < len(rows)
         and rows[index]["record"] == "event"
         and rows[index]["event_type"]
-        not in {"manual_reset", "reset_blocked", "reset_idle"}
+        not in {
+            "manual_reset",
+            "reset_blocked",
+            "reset_idle",
+            "repower_blocked",
+            "power_on_ready",
+        }
     ):
         events.append(rows[index])
         index += 1
