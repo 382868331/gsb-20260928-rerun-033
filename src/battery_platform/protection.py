@@ -105,6 +105,20 @@ class ProtectionController:
             name for name, state in self._states.items() if state.active or state.locked
         )
 
+    @property
+    def reset_ready_reasons(self) -> tuple[str, ...]:
+        return tuple(
+            name for name, state in self._states.items() if self._reset_ready(name)
+        )
+
+    @property
+    def reset_blocked_reasons(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, state in self._states.items()
+            if state.locked and not self._reset_ready(name)
+        )
+
     def update(self, measurement: Measurement) -> list[ProtectionEvent]:
         before_charge = self.charge_contactor_closed if self.events else True
         before_discharge = self.discharge_contactor_closed if self.events else True
@@ -145,26 +159,20 @@ class ProtectionController:
         for name, state in self._states.items():
             if not state.locked:
                 continue
-            recovery_has_persisted = (
-                state.recovery_candidate_since is not None
-                and reset_timestamp - state.recovery_candidate_since + 1e-9
-                >= getattr(self.config, name).recovery_delay
-            )
-            if state.active or (
-                not state.recovery_ready and not recovery_has_persisted
-            ):
+            if state.active or not self._reset_ready(name, reset_timestamp):
                 blocked.append(name)
                 continue
             state.locked = False
             state.recovery_ready = False
             state.recovery_candidate_since = None
+            state.candidate_since = None
             reset_names.append(name)
 
         details: dict[str, object] = {"reset_reasons": reset_names}
         if blocked:
             details["blocked_reasons"] = blocked
             details["recovery_conditions"] = self._recovery_summary()
-            event_type = "reset_blocked"
+            event_type = "manual_reset" if reset_names else "reset_blocked"
         else:
             event_type = "manual_reset" if reset_names else "reset_idle"
         event = self._make_event(event_type, reasons=tuple(reset_names), details=details)
@@ -173,6 +181,43 @@ class ProtectionController:
 
     def replay(self) -> list[ProtectionEvent]:
         return list(self.events)
+
+    def state_snapshot(self) -> dict[str, object]:
+        return {
+            "timestamp": self.current_timestamp,
+            "states": {
+                name: {
+                    "observed": state.observed,
+                    "candidate_since": state.candidate_since,
+                    "active": state.active,
+                    "recovery_candidate_since": state.recovery_candidate_since,
+                    "recovery_ready": state.recovery_ready,
+                    "locked": state.locked,
+                    "last_value": state.last_value,
+                    "source": state.source,
+                }
+                for name, state in self._states.items()
+            },
+        }
+
+    def restore_state(self, snapshot: dict[str, object]) -> None:
+        self.current_timestamp = snapshot["timestamp"]  # type: ignore[assignment]
+        states = snapshot["states"]
+        assert isinstance(states, dict)
+        for name, payload in states.items():
+            assert isinstance(payload, dict)
+            state = self._states[name]
+            for field_name in (
+                "observed",
+                "candidate_since",
+                "active",
+                "recovery_candidate_since",
+                "recovery_ready",
+                "locked",
+                "last_value",
+                "source",
+            ):
+                setattr(state, field_name, payload[field_name])
 
     def _observe(self, measurement: Measurement) -> dict[str, bool]:
         states = {name: False for name in self._states}
@@ -189,6 +234,21 @@ class ProtectionController:
             temperatures = temperatures[: self.config.expected_cells]
             temperatures += [None] * (self.config.expected_cells - len(temperatures))
 
+        valid_voltages = [
+            (index, float(value))
+            for index, value in enumerate(voltages)
+            if value is not None
+        ]
+        if valid_voltages:
+            over_index, over_value = max(valid_voltages, key=lambda item: item[1])
+            under_index, under_value = min(valid_voltages, key=lambda item: item[1])
+            self._remember(
+                "over_voltage", over_value, f"cell_{over_index + 1}_voltage"
+            )
+            self._remember(
+                "under_voltage", under_value, f"cell_{under_index + 1}_voltage"
+            )
+
         for index, value in enumerate(voltages):
             source = f"cell_{index + 1}_voltage"
             if value is None:
@@ -196,10 +256,23 @@ class ProtectionController:
                 continue
             if self._matches(self.config.over_voltage, float(value)):
                 states["over_voltage"] = True
-                self._remember("over_voltage", value, source)
             if self._matches(self.config.under_voltage, float(value)):
                 states["under_voltage"] = True
-                self._remember("under_voltage", value, source)
+
+        valid_temperatures = [
+            (index, float(value))
+            for index, value in enumerate(temperatures)
+            if value is not None
+        ]
+        if valid_temperatures:
+            temperature_index, temperature_value = max(
+                valid_temperatures, key=lambda item: item[1]
+            )
+            self._remember(
+                "over_temperature",
+                temperature_value,
+                f"cell_{temperature_index + 1}_temperature",
+            )
 
         for index, value in enumerate(temperatures):
             source = f"cell_{index + 1}_temperature"
@@ -208,13 +281,15 @@ class ProtectionController:
                 continue
             if self._matches(self.config.over_temperature, float(value)):
                 states["over_temperature"] = True
-                self._remember("over_temperature", value, source)
 
+        measurement_state = self._states["measurement_fault"]
         if missing_sources:
             states["measurement_fault"] = True
-            state = self._states["measurement_fault"]
-            state.last_value = None
-            state.source = ",".join(missing_sources)
+            measurement_state.last_value = None
+            measurement_state.source = ",".join(missing_sources)
+        else:
+            measurement_state.last_value = 1.0
+            measurement_state.source = "all_measurements_valid"
 
         return states
 
@@ -227,19 +302,25 @@ class ProtectionController:
         if observed:
             if state.candidate_since is None:
                 state.candidate_since = timestamp
+            state.recovery_candidate_since = None
+            state.recovery_ready = False
             if (
                 not state.active
                 and timestamp - state.candidate_since + 1e-9 >= rule.trigger_delay
             ):
                 state.active = True
-                state.recovery_ready = False
                 if rule.locked:
                     state.locked = True
                 return self._fault_event("protection_triggered", name)
             return None
 
         state.candidate_since = None
-        if not state.active:
+        if not state.active and not state.locked:
+            return None
+
+        if not self._matches_recovery(rule, state):
+            state.recovery_candidate_since = None
+            state.recovery_ready = False
             return None
 
         if state.recovery_candidate_since is None:
@@ -247,6 +328,7 @@ class ProtectionController:
         if (
             timestamp - state.recovery_candidate_since + 1e-9
             < rule.recovery_delay
+            or state.recovery_ready
         ):
             return None
 
@@ -260,7 +342,6 @@ class ProtectionController:
             )
 
         state.recovery_ready = False
-        state.recovery_candidate_since = None
         return self._fault_event("protection_released", name)
 
     def _matches(self, rule: FaultRule, value: float) -> bool:
@@ -268,6 +349,26 @@ class ProtectionController:
         if threshold is None:
             return False
         return value >= threshold if rule.direction == "above" else value <= threshold
+
+    def _matches_recovery(self, rule: FaultRule, state: _FaultState) -> bool:
+        threshold = rule.recovery_threshold
+        if threshold is None:
+            return state.last_value is not None
+        value = state.last_value
+        if value is None:
+            return False
+        return value <= threshold if rule.direction == "above" else value >= threshold
+
+    def _reset_ready(
+        self, name: str, timestamp: float | None = None
+    ) -> bool:
+        state = self._states[name]
+        if state.recovery_ready:
+            return True
+        if state.active or state.recovery_candidate_since is None or timestamp is None:
+            return False
+        rule = getattr(self.config, name)
+        return timestamp - state.recovery_candidate_since + 1e-9 >= rule.recovery_delay
 
     def _remember(self, name: str, value: float, source: str) -> None:
         state = self._states[name]

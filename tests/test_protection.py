@@ -51,6 +51,79 @@ def test_overvoltage_triggers_then_stays_locked_until_manual_reset():
     assert controller.charge_contactor_closed is True
 
 
+def test_overvoltage_reset_remains_blocked_above_recovery_threshold():
+    controller = ProtectionController()
+    controller.update(sample(0.0))
+    controller.update(sample(1.0, value=4.21))
+    controller.update(sample(2.0, value=4.21))
+
+    assert controller.charge_contactor_closed is False
+    assert controller.update(sample(3.0, value=4.15)) == []
+
+    reset = controller.request_reset(3.0)
+
+    assert reset[0].event_type == "reset_blocked"
+    assert reset[0].reasons == ()
+    assert reset[0].details["blocked_reasons"] == ["over_voltage"]
+    assert controller.charge_contactor_closed is False
+    assert "over_voltage" in controller.reset_blocked_reasons
+
+
+def test_recovery_timer_restarts_when_boundary_is_recrossed():
+    controller = ProtectionController()
+    controller.update(sample(0.0))
+    controller.update(sample(1.0, value=4.21))
+    controller.update(sample(2.0, value=4.21))
+
+    assert controller.update(sample(2.5, value=4.05)) == []
+    assert controller.update(sample(3.0, value=4.15)) == []
+    blocked = controller.request_reset(3.0)
+    assert blocked[0].event_type == "reset_blocked"
+
+    assert controller.update(sample(3.5, value=4.05)) == []
+    assert controller.update(sample(4.0, value=4.05)) == []
+    blocked_again = controller.request_reset(4.0)
+    assert blocked_again[0].event_type == "reset_blocked"
+
+    ready = controller.update(sample(4.5, value=4.05))
+    assert ready[0].event_type == "recovery_ready_manual_reset_required"
+    reset = controller.request_reset(4.5)
+    assert reset[0].event_type == "manual_reset"
+    assert controller.charge_contactor_closed is True
+
+
+def test_concurrent_latched_protections_keep_independent_reasons():
+    controller = ProtectionController(
+        ProtectionConfig(
+            over_temperature=FaultRule(55, 50, 0.0, 0.0),
+        )
+    )
+    controller.update(sample(0.0))
+    controller.update(sample(1.0, value=4.21, temperature=56))
+    controller.update(sample(2.0, value=4.21, temperature=56))
+
+    assert controller.charge_contactor_closed is False
+    assert controller.discharge_contactor_closed is False
+    assert set(controller.active_reasons) == {"over_voltage", "over_temperature"}
+
+    controller.update(sample(3.0, value=4.05, temperature=49))
+    partial_reset = controller.request_reset(3.0)
+
+    assert partial_reset[0].event_type == "manual_reset"
+    assert partial_reset[0].reasons == ("over_temperature",)
+    assert partial_reset[0].details["blocked_reasons"] == ["over_voltage"]
+    assert controller.charge_contactor_closed is False
+    assert controller.discharge_contactor_closed is True
+    assert controller.active_reasons == ("over_voltage",)
+
+    controller.update(sample(4.0, value=4.05, temperature=49))
+    full_reset = controller.request_reset(4.0)
+    assert full_reset[0].event_type == "manual_reset"
+    assert full_reset[0].reasons == ("over_voltage",)
+    assert controller.charge_contactor_closed is True
+    assert controller.discharge_contactor_closed is True
+
+
 def test_boundary_jitter_does_not_repeat_switching():
     controller = ProtectionController()
     for index in range(12):
