@@ -15,6 +15,19 @@
 - 默认保护原因会锁定；恢复值持续达到 recovery_delay 后，只记录“可恢复”，仍需人工复位。
 - 恢复阈值与触发阈值分离，边界来回抖动不会反复开闭接触器。
 - 任意缺失测量或通道数量错误都立即视为测量故障，不能按正常值放行。
+- 接触器命令与实际反馈分开记录：保护只产生“请求闭合/断开”，`Measurement` 中的
+  `charge_contactor_feedback` / `discharge_contactor_feedback` 才是物理观察状态；
+  命令已发出不代表物理动作已完成。
+- 反馈与命令不一致须持续 `contactor_mismatch.trigger_delay`（默认 0.5 s）才确认
+  `charge_contactor_mismatch` 或 `discharge_contactor_mismatch`。迟到的反馈在确认前
+  到达会取消计时；反馈抖动会重新计时；始终不动（触点烧结/机构卡死）在确认后锁定，
+  并强制断开双侧接触器。
+- 等待确认期间命令再次变化（如中途重开/重合）会清空已等待时间，必要等待不得被
+  缩短。
+- 不一致故障同样锁定：反馈恢复一致并持续 `recovery_delay` 后仅允许人工复位；
+  期间短暂恢复会重新计时。复位时只要其它保护仍有效，对应接触器就不会恢复闭合。
+- `VirtualContactor` 用虚拟时间模拟动作延迟、抖动与卡死；接触器请求与观察状态都
+  写入快照，重新上电后可继续核对不一致故障的锁定与复位前置条件。
 - 每次更新后可调用 `JsonlEventRecorder.record_controller_state()` 保存触发和恢复计时器；
   `restore_controller()` 用最后快照跨重启续跑，`replay_recording()` 则从首个样本重建并逐时刻核对事件、接触器和人工复位许可。
 

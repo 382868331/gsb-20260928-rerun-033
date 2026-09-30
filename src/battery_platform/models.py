@@ -8,6 +8,8 @@ FaultName = Literal[
     "under_voltage",
     "over_temperature",
     "measurement_fault",
+    "charge_contactor_mismatch",
+    "discharge_contactor_mismatch",
 ]
 
 
@@ -18,12 +20,16 @@ class Measurement:
     timestamp: float
     voltages: list[float | None]
     temperatures: list[float | None]
+    charge_contactor_feedback: bool | None = None
+    discharge_contactor_feedback: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "timestamp": self.timestamp,
             "voltages": list(self.voltages),
             "temperatures": list(self.temperatures),
+            "charge_contactor_feedback": self.charge_contactor_feedback,
+            "discharge_contactor_feedback": self.discharge_contactor_feedback,
         }
 
 

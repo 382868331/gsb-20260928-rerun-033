@@ -1,6 +1,6 @@
 from .models import Measurement, ProtectionEvent
 from .protection import ProtectionConfig, ProtectionController
-from .simulator import VirtualBatteryPack
+from .simulator import VirtualBatteryPack, VirtualContactor
 
 __all__ = [
     "Measurement",
@@ -8,4 +8,5 @@ __all__ = [
     "ProtectionController",
     "ProtectionEvent",
     "VirtualBatteryPack",
+    "VirtualContactor",
 ]

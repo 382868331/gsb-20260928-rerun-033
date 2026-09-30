@@ -80,6 +80,8 @@ def test_recording_replays_per_sample_permissions_across_restart(tmp_path):
         "timestamp": 4.0,
         "charge_contactor_closed": False,
         "discharge_contactor_closed": False,
+        "charge_contactor_observed_closed": None,
+        "discharge_contactor_observed_closed": None,
         "active_reasons": ("over_voltage", "measurement_fault"),
         "reset_ready_reasons": (),
         "reset_blocked_reasons": ("over_voltage", "measurement_fault"),

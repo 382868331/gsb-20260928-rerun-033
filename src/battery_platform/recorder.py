@@ -70,6 +70,10 @@ def replay_recording(
                 timestamp=timestamp,
                 voltages=list(row["voltages"]),
                 temperatures=list(row["temperatures"]),
+                charge_contactor_feedback=row.get("charge_contactor_feedback"),
+                discharge_contactor_feedback=row.get(
+                    "discharge_contactor_feedback"
+                ),
             )
             produced = controller.update(measurement)
             expected = _take_following_events(rows, index)
@@ -128,6 +132,12 @@ def _trace_point(
         "timestamp": timestamp,
         "charge_contactor_closed": controller.charge_contactor_closed,
         "discharge_contactor_closed": controller.discharge_contactor_closed,
+        "charge_contactor_observed_closed": (
+            controller.charge_contactor_observed_closed
+        ),
+        "discharge_contactor_observed_closed": (
+            controller.discharge_contactor_observed_closed
+        ),
         "active_reasons": controller.active_reasons,
         "reset_ready_reasons": controller.reset_ready_reasons,
         "reset_blocked_reasons": controller.reset_blocked_reasons,
