@@ -16,6 +16,26 @@
 - 恢复阈值与触发阈值分离，边界来回抖动不会反复开闭接触器。
 - 任意缺失测量或通道数量错误都立即视为测量故障，不能按正常值放行。
 
+恢复计时只有在越过恢复阈值后才开始；测量落在触发与恢复阈值之间（例如 4.15V
+介于 4.20V 触发与 4.10V 恢复之间）时保持保护动作并拒绝人工复位。恢复期间重新
+越界会清零计时并重新开始，同时记录 `recovery_interrupted`。多种保护原因各自
+独立触发、计时、锁定和复位，解除其中一种不会放开其他原因仍在断开的接触器。
+
+## 记录重放核对
+
+`replay_protection(path)` 用 JSONL 中的原始测量重新驱动一个全新的
+`ProtectionController`，逐条比对事件类型、接触器状态、活动与锁定原因，而不是
+只检查日志里是否写出阈值。重启造成末行 JSON 截断时会忽略该残行，仍可核对此前
+的完整记录：
+
+~~~python
+from battery_platform.recorder import replay_protection
+
+result = replay_protection("protection_log.jsonl")
+assert result.consistent
+assert result.controller.charge_contactor_closed
+~~~
+
 ## 测试配置
 
 可直接在测试中构造配置，也可从字典加载：

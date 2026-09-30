@@ -52,7 +52,6 @@ class ProtectionConfig:
 
 @dataclass
 class _FaultState:
-    observed: bool = False
     candidate_since: float | None = None
     active: bool = False
     recovery_candidate_since: float | None = None
@@ -60,6 +59,16 @@ class _FaultState:
     locked: bool = False
     last_value: float | None = None
     source: str = ""
+
+
+# Observation relative to the trigger/recovery thresholds.
+# "fault" means beyond the trigger threshold, "safe" means beyond the
+# recovery threshold, "hysteresis" means between the two thresholds, and
+# "inactive" is used by threshold-less rules (e.g. measurement fault).
+_FAULT = "fault"
+_SAFE = "safe"
+_HYSTERESIS = "hysteresis"
+_INACTIVE = "inactive"
 
 
 class ProtectionController:
@@ -112,8 +121,8 @@ class ProtectionController:
 
         observations = self._observe(measurement)
         produced: list[ProtectionEvent] = []
-        for name, observed in observations.items():
-            event = self._update_fault(name, observed, measurement.timestamp)
+        for name, condition in observations.items():
+            event = self._update_fault(name, condition, measurement.timestamp)
             if event is not None:
                 produced.append(event)
 
@@ -145,14 +154,7 @@ class ProtectionController:
         for name, state in self._states.items():
             if not state.locked:
                 continue
-            recovery_has_persisted = (
-                state.recovery_candidate_since is not None
-                and reset_timestamp - state.recovery_candidate_since + 1e-9
-                >= getattr(self.config, name).recovery_delay
-            )
-            if state.active or (
-                not state.recovery_ready and not recovery_has_persisted
-            ):
+            if state.active or not state.recovery_ready:
                 blocked.append(name)
                 continue
             state.locked = False
@@ -161,11 +163,14 @@ class ProtectionController:
             reset_names.append(name)
 
         details: dict[str, object] = {"reset_reasons": reset_names}
-        if blocked:
+        if blocked and not reset_names:
             details["blocked_reasons"] = blocked
             details["recovery_conditions"] = self._recovery_summary()
             event_type = "reset_blocked"
         else:
+            if blocked:
+                details["blocked_reasons"] = blocked
+                details["recovery_conditions"] = self._recovery_summary()
             event_type = "manual_reset" if reset_names else "reset_idle"
         event = self._make_event(event_type, reasons=tuple(reset_names), details=details)
         self.events.append(event)
@@ -174,8 +179,8 @@ class ProtectionController:
     def replay(self) -> list[ProtectionEvent]:
         return list(self.events)
 
-    def _observe(self, measurement: Measurement) -> dict[str, bool]:
-        states = {name: False for name in self._states}
+    def _observe(self, measurement: Measurement) -> dict[str, str]:
+        conditions = {name: _INACTIVE for name in self._states}
         missing_sources: list[str] = []
 
         voltages = list(measurement.voltages)
@@ -194,39 +199,53 @@ class ProtectionController:
             if value is None:
                 missing_sources.append(source)
                 continue
-            if self._matches(self.config.over_voltage, float(value)):
-                states["over_voltage"] = True
-                self._remember("over_voltage", value, source)
-            if self._matches(self.config.under_voltage, float(value)):
-                states["under_voltage"] = True
-                self._remember("under_voltage", value, source)
+            value_f = float(value)
+            condition = self._classify(self.config.over_voltage, value_f)
+            if self._worse(condition, conditions["over_voltage"]):
+                conditions["over_voltage"] = condition
+            if condition == _FAULT:
+                self._remember("over_voltage", value_f, source)
+            under_condition = self._classify(
+                self.config.under_voltage, value_f
+            )
+            if self._worse(under_condition, conditions["under_voltage"]):
+                conditions["under_voltage"] = under_condition
+            if under_condition == _FAULT:
+                self._remember("under_voltage", value_f, source)
 
         for index, value in enumerate(temperatures):
             source = f"cell_{index + 1}_temperature"
             if value is None:
                 missing_sources.append(source)
                 continue
-            if self._matches(self.config.over_temperature, float(value)):
-                states["over_temperature"] = True
-                self._remember("over_temperature", value, source)
+            value_f = float(value)
+            condition = self._classify(self.config.over_temperature, value_f)
+            if self._worse(condition, conditions["over_temperature"]):
+                conditions["over_temperature"] = condition
+            if condition == _FAULT:
+                self._remember("over_temperature", value_f, source)
 
         if missing_sources:
-            states["measurement_fault"] = True
+            conditions["measurement_fault"] = _FAULT
             state = self._states["measurement_fault"]
             state.last_value = None
             state.source = ",".join(missing_sources)
+        else:
+            conditions["measurement_fault"] = _SAFE
 
-        return states
+        return conditions
 
     def _update_fault(
-        self, name: str, observed: bool, timestamp: float
+        self, name: str, condition: str, timestamp: float
     ) -> ProtectionEvent | None:
         rule = getattr(self.config, name)
         state = self._states[name]
 
-        if observed:
+        if condition == _FAULT:
             if state.candidate_since is None:
                 state.candidate_since = timestamp
+            state.recovery_candidate_since = None
+            state.recovery_ready = False
             if (
                 not state.active
                 and timestamp - state.candidate_since + 1e-9 >= rule.trigger_delay
@@ -238,8 +257,24 @@ class ProtectionController:
                 return self._fault_event("protection_triggered", name)
             return None
 
+        # Outside the trigger zone the trigger debounce must restart.
         state.candidate_since = None
-        if not state.active:
+
+        # The hysteresis band keeps the fault active without counting toward
+        # recovery; leaving the safe side restarts the recovery timer.
+        if condition != _SAFE:
+            interrupted = state.recovery_candidate_since is not None
+            state.recovery_candidate_since = None
+            # Leaving the safe side cancels both in-progress recovery and
+            # previously reached readiness: the value is no longer safe.
+            state.recovery_ready = False
+            if interrupted and state.active:
+                return self._fault_event("recovery_interrupted", name)
+            return None
+
+        if not state.active and not state.recovery_ready:
+            state.recovery_candidate_since = None
+            state.recovery_ready = False
             return None
 
         if state.recovery_candidate_since is None:
@@ -251,6 +286,7 @@ class ProtectionController:
             return None
 
         state.active = False
+        state.recovery_candidate_since = None
         if state.locked:
             state.recovery_ready = True
             return self._fault_event(
@@ -260,14 +296,29 @@ class ProtectionController:
             )
 
         state.recovery_ready = False
-        state.recovery_candidate_since = None
         return self._fault_event("protection_released", name)
 
-    def _matches(self, rule: FaultRule, value: float) -> bool:
+    @staticmethod
+    def _worse(candidate: str, current: str) -> bool:
+        rank = {_INACTIVE: 0, _SAFE: 1, _HYSTERESIS: 2, _FAULT: 3}
+        return rank[candidate] > rank[current]
+
+    def _classify(self, rule: FaultRule, value: float) -> str:
         threshold = rule.trigger_threshold
         if threshold is None:
-            return False
-        return value >= threshold if rule.direction == "above" else value <= threshold
+            return _INACTIVE
+        recovery = rule.recovery_threshold
+        if rule.direction == "above":
+            if value >= threshold:
+                return _FAULT
+            if recovery is None or value <= recovery:
+                return _SAFE
+            return _HYSTERESIS
+        if value <= threshold:
+            return _FAULT
+        if recovery is None or value >= recovery:
+            return _SAFE
+        return _HYSTERESIS
 
     def _remember(self, name: str, value: float, source: str) -> None:
         state = self._states[name]
