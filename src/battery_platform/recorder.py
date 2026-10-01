@@ -74,6 +74,7 @@ def replay_recording(
                 discharge_contactor_feedback=row.get(
                     "discharge_contactor_feedback"
                 ),
+                load_voltage=row.get("load_voltage"),
             )
             produced = controller.update(measurement)
             expected = _take_following_events(rows, index)
@@ -141,4 +142,7 @@ def _trace_point(
         "active_reasons": controller.active_reasons,
         "reset_ready_reasons": controller.reset_ready_reasons,
         "reset_blocked_reasons": controller.reset_blocked_reasons,
+        "post_disconnect_verification": (
+            controller.post_disconnect_verification
+        ),
     }

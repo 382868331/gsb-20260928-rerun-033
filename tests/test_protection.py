@@ -104,24 +104,37 @@ def test_concurrent_latched_protections_keep_independent_reasons():
 
     assert controller.charge_contactor_closed is False
     assert controller.discharge_contactor_closed is False
-    assert set(controller.active_reasons) == {"over_voltage", "over_temperature"}
+    assert set(controller.active_reasons) == {
+        "over_voltage",
+        "over_temperature",
+        "post_disconnect_voltage_verification",
+    }
 
     controller.update(sample(3.0, value=4.05, temperature=49))
     partial_reset = controller.request_reset(3.0)
 
     assert partial_reset[0].event_type == "manual_reset"
     assert partial_reset[0].reasons == ("over_temperature",)
-    assert partial_reset[0].details["blocked_reasons"] == ["over_voltage"]
+    assert set(partial_reset[0].details["blocked_reasons"]) == {
+        "over_voltage",
+        "post_disconnect_voltage_verification",
+    }
     assert controller.charge_contactor_closed is False
-    assert controller.discharge_contactor_closed is True
-    assert controller.active_reasons == ("over_voltage",)
+    assert controller.discharge_contactor_closed is False
+    assert set(controller.active_reasons) == {
+        "over_voltage",
+        "post_disconnect_voltage_verification",
+    }
 
     controller.update(sample(4.0, value=4.05, temperature=49))
-    full_reset = controller.request_reset(4.0)
-    assert full_reset[0].event_type == "manual_reset"
-    assert full_reset[0].reasons == ("over_voltage",)
-    assert controller.charge_contactor_closed is True
-    assert controller.discharge_contactor_closed is True
+    second_reset = controller.request_reset(4.0)
+    assert second_reset[0].event_type == "manual_reset"
+    assert second_reset[0].reasons == ("over_voltage",)
+    assert second_reset[0].details["blocked_reasons"] == [
+        "post_disconnect_voltage_verification"
+    ]
+    assert controller.charge_contactor_closed is False
+    assert controller.discharge_contactor_closed is False
 
 
 def test_boundary_jitter_does_not_repeat_switching():

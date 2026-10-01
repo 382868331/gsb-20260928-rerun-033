@@ -34,6 +34,9 @@ class ProtectionConfig:
     contactor_mismatch: FaultRule = field(
         default_factory=lambda: FaultRule(None, None, 0.5, 1.0)
     )
+    post_disconnect_voltage: FaultRule = field(
+        default_factory=lambda: FaultRule(5.0, 5.0, 0.0, 0.5)
+    )
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "ProtectionConfig":
@@ -43,6 +46,7 @@ class ProtectionConfig:
             "over_temperature",
             "measurement_fault",
             "contactor_mismatch",
+            "post_disconnect_voltage",
         )
         kwargs: dict[str, object] = {}
         if "expected_cells" in payload:
@@ -69,10 +73,27 @@ class _FaultState:
 @dataclass
 class _ContactorState:
     requested_closed: bool | None = None
+    requested_since: float | None = None
     observed_closed: bool | None = None
+    observed_since: float | None = None
     mismatch: bool = False
     mismatch_since: float | None = None
     recovery_candidate_since: float | None = None
+
+
+@dataclass
+class _DisconnectVerification:
+    required: bool = False
+    both_open_since: float | None = None
+    low_voltage_since: float | None = None
+    active: bool = False
+    locked: bool = False
+    recovery_ready: bool = False
+    failure_reason: str = ""
+    last_voltage: float | None = None
+    actual_disconnect_contactor: str | None = None
+    last_opened_contactor: str | None = None
+    low_voltage_observed: bool = False
 
 
 class ProtectionController:
@@ -85,6 +106,7 @@ class ProtectionController:
         "measurement_fault": "open_both_contactors",
         "charge_contactor_mismatch": "open_both_contactors",
         "discharge_contactor_mismatch": "open_both_contactors",
+        "post_disconnect_voltage_verification": "open_both_contactors",
     }
     _CONTACTOR_EFFECT: ClassVar[dict[str, tuple[bool, bool]]] = {
         "open_charge_contactor": (True, False),
@@ -109,8 +131,10 @@ class ProtectionController:
             "charge": _ContactorState(),
             "discharge": _ContactorState(),
         }
+        self._disconnect_verification = _DisconnectVerification()
         self.events: list[ProtectionEvent] = []
         self.current_timestamp: float | None = None
+        self.current_load_voltage: float | None = None
 
     @property
     def charge_contactor_closed(self) -> bool:
@@ -129,6 +153,25 @@ class ProtectionController:
         return self._contactors["discharge"].observed_closed
 
     @property
+    def post_disconnect_verification(self) -> dict[str, object]:
+        verification = self._disconnect_verification
+        return {
+            "required": verification.required,
+            "active": verification.active,
+            "locked": verification.locked,
+            "recovery_ready": verification.recovery_ready,
+            "both_open_since": verification.both_open_since,
+            "low_voltage_since": verification.low_voltage_since,
+            "failure_reason": verification.failure_reason,
+            "last_voltage": verification.last_voltage,
+            "actual_disconnect_contactor": (
+                verification.actual_disconnect_contactor
+            ),
+            "last_opened_contactor": verification.last_opened_contactor,
+            "low_voltage_observed": verification.low_voltage_observed,
+        }
+
+    @property
     def contactor_mismatch_reasons(self) -> tuple[str, ...]:
         return tuple(
             name
@@ -139,23 +182,37 @@ class ProtectionController:
 
     @property
     def active_reasons(self) -> tuple[str, ...]:
-        return tuple(
+        reasons = [
             name for name, state in self._states.items() if state.active or state.locked
-        )
+        ]
+        verification = self._disconnect_verification
+        if verification.active or verification.locked:
+            reasons.append("post_disconnect_voltage_verification")
+        return tuple(reasons)
 
     @property
     def reset_ready_reasons(self) -> tuple[str, ...]:
-        return tuple(
+        reasons = [
             name for name, state in self._states.items() if self._reset_ready(name)
-        )
+        ]
+        if (
+            self._disconnect_verification.locked
+            and self._disconnect_verification.recovery_ready
+        ):
+            reasons.append("post_disconnect_voltage_verification")
+        return tuple(reasons)
 
     @property
     def reset_blocked_reasons(self) -> tuple[str, ...]:
-        return tuple(
+        reasons = [
             name
             for name, state in self._states.items()
             if state.locked and not self._reset_ready(name)
-        )
+        ]
+        verification = self._disconnect_verification
+        if verification.required and (verification.active or verification.locked) and not verification.recovery_ready:
+            reasons.append("post_disconnect_voltage_verification")
+        return tuple(reasons)
 
     def update(self, measurement: Measurement) -> list[ProtectionEvent]:
         before_charge = (
@@ -167,6 +224,7 @@ class ProtectionController:
         self.current_timestamp = measurement.timestamp
 
         observations = self._observe(measurement)
+        self.current_load_voltage = measurement.load_voltage
         produced: list[ProtectionEvent] = []
         for name in (
             "over_voltage",
@@ -179,7 +237,7 @@ class ProtectionController:
             if event is not None:
                 produced.append(event)
 
-        self._dispatch_contactor_commands()
+        self._dispatch_contactor_commands(measurement.timestamp)
 
         for contactor_name, observed in (
             ("charge", measurement.charge_contactor_feedback),
@@ -192,7 +250,10 @@ class ProtectionController:
                 produced.append(event)
 
         # A newly confirmed mismatch forces the opposite pole open as well.
-        self._dispatch_contactor_commands()
+        self._dispatch_contactor_commands(measurement.timestamp)
+
+        verification_events = self._update_disconnect_verification(measurement)
+        produced.extend(verification_events)
 
         after_charge = self.charge_contactor_closed
         after_discharge = self.discharge_contactor_closed
@@ -219,6 +280,23 @@ class ProtectionController:
 
         reset_names = []
         blocked = []
+        verification = self._disconnect_verification
+        if (
+            verification.required
+            and (verification.active or verification.locked)
+            and not verification.recovery_ready
+        ):
+            blocked.append("post_disconnect_voltage_verification")
+        elif verification.locked and verification.recovery_ready:
+            verification.required = False
+            verification.active = False
+            verification.locked = False
+            verification.recovery_ready = False
+            verification.both_open_since = None
+            verification.low_voltage_since = None
+            verification.low_voltage_observed = False
+            verification.failure_reason = ""
+            reset_names.append("post_disconnect_voltage_verification")
         for name, state in self._states.items():
             if not state.locked:
                 continue
@@ -248,7 +326,7 @@ class ProtectionController:
         else:
             event_type = "manual_reset" if reset_names else "reset_idle"
         event = self._make_event(event_type, reasons=tuple(reset_names), details=details)
-        self._dispatch_contactor_commands()
+        self._dispatch_contactor_commands(reset_timestamp)
         self.events.append(event)
         return [event]
 
@@ -256,6 +334,7 @@ class ProtectionController:
         return list(self.events)
 
     def state_snapshot(self) -> dict[str, object]:
+        verification = self._disconnect_verification
         return {
             "timestamp": self.current_timestamp,
             "states": {
@@ -274,17 +353,35 @@ class ProtectionController:
             "contactors": {
                 name: {
                     "requested_closed": contactor.requested_closed,
+                    "requested_since": contactor.requested_since,
                     "observed_closed": contactor.observed_closed,
+                    "observed_since": contactor.observed_since,
                     "mismatch": contactor.mismatch,
                     "mismatch_since": contactor.mismatch_since,
                     "recovery_candidate_since": contactor.recovery_candidate_since,
                 }
                 for name, contactor in self._contactors.items()
             },
+            "disconnect_verification": {
+                "required": verification.required,
+                "both_open_since": verification.both_open_since,
+                "low_voltage_since": verification.low_voltage_since,
+                "active": verification.active,
+                "locked": verification.locked,
+                "recovery_ready": verification.recovery_ready,
+                "failure_reason": verification.failure_reason,
+                "last_voltage": verification.last_voltage,
+                "actual_disconnect_contactor": (
+                    verification.actual_disconnect_contactor
+                ),
+                "last_opened_contactor": verification.last_opened_contactor,
+                "low_voltage_observed": verification.low_voltage_observed,
+            },
         }
 
     def restore_state(self, snapshot: dict[str, object]) -> None:
         self.current_timestamp = snapshot["timestamp"]  # type: ignore[assignment]
+        verification = self._disconnect_verification
         states = snapshot["states"]
         assert isinstance(states, dict)
         for name, payload in states.items():
@@ -308,12 +405,34 @@ class ProtectionController:
                 contactor = self._contactors[name]
                 for field_name in (
                     "requested_closed",
+                    "requested_since",
                     "observed_closed",
+                    "observed_since",
                     "mismatch",
                     "mismatch_since",
                     "recovery_candidate_since",
                 ):
                     setattr(contactor, field_name, payload[field_name])
+        verification_payload = snapshot.get("disconnect_verification")
+        if isinstance(verification_payload, dict):
+            for field_name in (
+                "required",
+                "both_open_since",
+                "low_voltage_since",
+                "active",
+                "locked",
+                "recovery_ready",
+                "failure_reason",
+                "last_voltage",
+                "actual_disconnect_contactor",
+                "last_opened_contactor",
+                "low_voltage_observed",
+            ):
+                setattr(
+                    verification,
+                    field_name,
+                    verification_payload.get(field_name, getattr(verification, field_name)),
+                )
 
     def _observe(self, measurement: Measurement) -> dict[str, bool]:
         states = {name: False for name in self._states}
@@ -489,9 +608,12 @@ class ProtectionController:
             blocks_charge, blocks_discharge = self._CONTACTOR_EFFECT[action]
             charge = charge or blocks_charge
             discharge = discharge or blocks_discharge
+        if self._disconnect_verification.active or self._disconnect_verification.locked:
+            charge = True
+            discharge = True
         return charge, discharge
 
-    def _dispatch_contactor_commands(self) -> None:
+    def _dispatch_contactor_commands(self, timestamp: float | None = None) -> None:
         """Issue latest requested open/closed commands to each contactor.
 
         A changed command invalidates any in-progress mismatch confirmation
@@ -507,6 +629,7 @@ class ProtectionController:
             if contactor.requested_closed == requested_closed:
                 continue
             contactor.requested_closed = requested_closed
+            contactor.requested_since = timestamp
             contactor.mismatch = False
             contactor.mismatch_since = None
             contactor.recovery_candidate_since = None
@@ -522,7 +645,12 @@ class ProtectionController:
         timestamp: float,
     ) -> ProtectionEvent | None:
         contactor = self._contactors[contactor_name]
+        previous_observed = contactor.observed_closed
         contactor.observed_closed = observed_closed
+        if observed_closed != previous_observed:
+            contactor.observed_since = timestamp
+            if observed_closed is False:
+                self._disconnect_verification.last_opened_contactor = contactor_name
         if observed_closed is None:
             contactor.mismatch = False
             contactor.mismatch_since = None
@@ -598,6 +726,147 @@ class ProtectionController:
             observed_closed,
         )
 
+    def _update_disconnect_verification(
+        self, measurement: Measurement
+    ) -> list[ProtectionEvent]:
+        verification = self._disconnect_verification
+        if not (
+            self._contactors["charge"].requested_closed is False
+            and self._contactors["discharge"].requested_closed is False
+        ):
+            return []
+
+        verification.required = True
+        verification.active = True
+        timestamp = measurement.timestamp
+        charge_open = measurement.charge_contactor_feedback is False
+        discharge_open = measurement.discharge_contactor_feedback is False
+        voltage = measurement.load_voltage
+        verification.last_voltage = voltage
+        events: list[ProtectionEvent] = []
+
+        if charge_open and discharge_open:
+            charge_since = self._contactors["charge"].observed_since
+            discharge_since = self._contactors["discharge"].observed_since
+            both_open_since = max(
+                value for value in (charge_since, discharge_since) if value is not None
+            )
+            if verification.both_open_since is None:
+                verification.both_open_since = both_open_since
+                verification.failure_reason = ""
+                events.append(
+                    self._verification_event(
+                        "post_disconnect_verification_started",
+                        reason="waiting_for_sustained_low_voltage",
+                    )
+                )
+        else:
+            closed_names = [
+                name
+                for name in ("charge", "discharge")
+                if self._contactors[name].observed_closed is not False
+            ]
+            verification.failure_reason = "waiting_for_contactor_feedback:"
+            verification.failure_reason += ",".join(closed_names) or "missing_feedback"
+
+        if not charge_open or not discharge_open:
+            verification.low_voltage_since = None
+        elif voltage is None:
+            verification.low_voltage_since = None
+            verification.locked = True
+            events.append(
+                self._verification_failure_event(
+                    "load_voltage_observation_missing"
+                )
+            )
+        elif voltage >= self.config.post_disconnect_voltage.recovery_threshold:
+            had_low_voltage = (
+                verification.low_voltage_since is not None
+                or verification.low_voltage_observed
+            )
+            reason = (
+                "voltage_recovered"
+                if had_low_voltage
+                else "open_feedback_contradicts_voltage"
+            )
+            verification.low_voltage_since = None
+            verification.locked = True
+            events.append(
+                self._verification_failure_event(reason)
+            )
+        else:
+            verification.low_voltage_observed = True
+            if verification.low_voltage_since is None:
+                verification.low_voltage_since = timestamp
+            if (
+                timestamp - verification.low_voltage_since + 1e-9
+                >= self.config.post_disconnect_voltage.recovery_delay
+            ):
+                previous_reason = verification.failure_reason
+                verification.active = False
+                verification.locked = True
+                verification.recovery_ready = True
+                verification.failure_reason = ""
+                charge_since = self._contactors["charge"].observed_since
+                discharge_since = self._contactors["discharge"].observed_since
+                verification.actual_disconnect_contactor = "both"
+                if charge_since is not None and discharge_since is not None:
+                    if charge_since < discharge_since:
+                        verification.actual_disconnect_contactor = "discharge"
+                    elif discharge_since < charge_since:
+                        verification.actual_disconnect_contactor = "charge"
+                event = self._verification_event(
+                    "post_disconnect_verification_passed",
+                    reason="sustained_low_voltage",
+                )
+                if previous_reason:
+                    event.details["previous_failure_reason"] = previous_reason
+                events.append(event)
+
+        return events
+
+    def _verification_failure_event(
+        self, reason: str
+    ) -> ProtectionEvent | None:
+        verification = self._disconnect_verification
+        if verification.failure_reason == reason and not verification.recovery_ready:
+            return None
+        verification.failure_reason = reason
+        verification.recovery_ready = False
+        return self._verification_event(
+            "post_disconnect_verification_failed",
+            reason=reason,
+        )
+
+    def _verification_event(
+        self, event_type: str, reason: str
+    ) -> ProtectionEvent:
+        verification = self._disconnect_verification
+        rule = self.config.post_disconnect_voltage
+        details = {
+            "source": "load_voltage_and_contactor_feedback",
+            "failure_reason": verification.failure_reason or reason,
+            "load_voltage": verification.last_voltage,
+            "safe_voltage_threshold": rule.recovery_threshold,
+            "required_low_voltage_duration": rule.recovery_delay,
+            "both_open_since": verification.both_open_since,
+            "low_voltage_since": verification.low_voltage_since,
+            "actual_disconnect_contactor": (
+                verification.actual_disconnect_contactor
+            ),
+            "charge_feedback": (
+                self._contactors["charge"].observed_closed
+            ),
+            "discharge_feedback": (
+                self._contactors["discharge"].observed_closed
+            ),
+        }
+        return self._make_event(
+            event_type,
+            reasons=("post_disconnect_voltage_verification",),
+            details=details,
+        )
+
     def _mismatch_event(
         self,
         event_type: str,
@@ -655,10 +924,26 @@ class ProtectionController:
             discharge_contactor_closed=self.discharge_contactor_closed,
             active_reasons=self.active_reasons,
             locked_reasons=tuple(
-                name for name, state in self._states.items() if state.locked
+                [name for name, state in self._states.items() if state.locked]
+                + (
+                    ["post_disconnect_voltage_verification"]
+                    if self._disconnect_verification.locked
+                    else []
+                )
             ),
             reasons=reasons,
-            details=details,
+            details={
+                **details,
+                "charge_command_closed": self.charge_contactor_closed,
+                "discharge_command_closed": self.discharge_contactor_closed,
+                "charge_feedback_closed": (
+                    self._contactors["charge"].observed_closed
+                ),
+                "discharge_feedback_closed": (
+                    self._contactors["discharge"].observed_closed
+                ),
+                "load_voltage": self.current_load_voltage,
+            },
         )
 
     def _recovery_summary(self) -> dict[str, object]:
@@ -674,5 +959,20 @@ class ProtectionController:
                 "recovery_threshold": rule.recovery_threshold,
                 "recovery_delay": rule.recovery_delay,
                 "manual_reset_required": rule.locked,
+            }
+        verification = self._disconnect_verification
+        if verification.required:
+            rule = self.config.post_disconnect_voltage
+            summary["post_disconnect_voltage_verification"] = {
+                "active": verification.active,
+                "locked": verification.locked,
+                "recovery_ready": verification.recovery_ready,
+                "recovery_threshold": rule.recovery_threshold,
+                "recovery_delay": rule.recovery_delay,
+                "manual_reset_required": True,
+                "failure_reason": verification.failure_reason,
+                "actual_disconnect_contactor": (
+                    verification.actual_disconnect_contactor
+                ),
             }
         return summary

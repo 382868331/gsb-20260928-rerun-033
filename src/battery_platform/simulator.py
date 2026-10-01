@@ -69,6 +69,7 @@ class VirtualBatteryPack:
         temperature_fn: Callable[[int, float], float | None] | None = None,
         charge_feedback: bool | None = None,
         discharge_feedback: bool | None = None,
+        load_voltage: float | None = None,
     ) -> Measurement:
         timestamp = self.time
         voltages = [
@@ -90,6 +91,7 @@ class VirtualBatteryPack:
             temperatures,
             charge_contactor_feedback=charge_feedback,
             discharge_contactor_feedback=discharge_feedback,
+            load_voltage=load_voltage,
         )
 
     def boundary_jitter_sequence(self, cycles: int = 4) -> list[Measurement]:

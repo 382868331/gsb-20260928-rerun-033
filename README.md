@@ -22,6 +22,21 @@
   `charge_contactor_mismatch` 或 `discharge_contactor_mismatch`。迟到的反馈在确认前
   到达会取消计时；反馈抖动会重新计时；始终不动（触点烧结/机构卡死）在确认后锁定，
   并强制断开双侧接触器。
+- 两只串联接触器分别记录命令时间、反馈时间和当前观测值。单只迟到、单只卡住和两侧
+  反馈/电压证据互相矛盾都沿同一条记录保留，不能因为另一只接触器反馈正常而清除已确认
+  的卡住故障。
+- 双侧安全断开必须再做负载侧电压验证：`Measurement.load_voltage` 是断开后的持续观测
+  依据；两只反馈均为断开后，负载电压还必须持续低于
+  `post_disconnect_voltage.recovery_threshold` 达到 `recovery_delay`。
+- 验证未完成、负载电压观测缺失、电压未按预期下降或短暂恢复，都会分别保留
+  `waiting_for_contactor_feedback:*`、`load_voltage_observation_missing`、
+  `open_feedback_contradicts_voltage` 与 `voltage_recovered` 原因；人工复位不能跳过
+  未完成或失败的验证。
+- 验证事件记录 `actual_disconnect_contactor`，用持续低压证据说明真正完成电气隔离的是
+  哪一只接触器或双侧共同完成；只有反馈断开不能直接允许再次上电。
+- 验证期间命令短暂重开又继续断开时，原双反馈断开时间和已积累的低压观察不被清空；
+  相关计时器和故障原因写入快照，重启或实验重开后继续等待，已确认的粘连/矛盾故障
+  仍保持锁定。
 - 等待确认期间命令再次变化（如中途重开/重合）会清空已等待时间，必要等待不得被
   缩短。
 - 不一致故障同样锁定：反馈恢复一致并持续 `recovery_delay` 后仅允许人工复位；
@@ -66,4 +81,6 @@ PYTHONPATH=src python -m pytest -q
 PYTHONPATH=src python -m battery_platform.manual_observe --output protection_log.jsonl
 ~~~
 
-人工观测脚本会生成在触发/恢复阈值之间抖动的原始样本，并保存完整测量与决策轨迹。
+人工观测脚本会生成在触发/恢复阈值之间抖动的原始样本，并保存完整测量、命令、反馈、
+负载电压依据与决策轨迹。实验时可调整两只 `VirtualContactor` 的 `actuation_delay`、
+`stuck` 和动作顺序，在 JSONL 中比较不同故障注入位置的命令—反馈—电压时间线。

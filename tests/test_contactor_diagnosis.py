@@ -13,13 +13,15 @@ def sample(
     temperature=30.0,
     charge_feedback=None,
     discharge_feedback=None,
+    load_voltage=4.0,
 ):
     return Measurement(
         timestamp,
         [value, 3.7, 3.7, 3.7],
         [temperature, 30.0, 30.0, 30.0],
         charge_contactor_feedback=charge_feedback,
-            discharge_contactor_feedback=discharge_feedback,
+        discharge_contactor_feedback=discharge_feedback,
+        load_voltage=load_voltage,
     )
 
 
@@ -94,10 +96,11 @@ def test_stuck_open_feedback_confirms_mismatch_and_latches():
     # A reset while the contactor is still stuck is blocked.
     blocked = controller.request_reset(2.0)
     assert blocked[0].event_type == "reset_blocked"
-    assert blocked[0].details["blocked_reasons"] == [
+    assert set(blocked[0].details["blocked_reasons"]) == {
         "over_voltage",
         "charge_contactor_mismatch",
-    ]
+        "post_disconnect_voltage_verification",
+    }
 
 
 def test_brief_feedback_recovery_during_wait_restarts_timing():
@@ -192,6 +195,7 @@ def test_independent_protections_are_not_released_by_another_reset(tmp_path=None
     assert set(controller.active_reasons) == {
         "over_voltage",
         "over_temperature",
+        "post_disconnect_voltage_verification",
     }
 
     # Temperature recovers and resets; over-voltage must keep the charge pole
@@ -201,7 +205,10 @@ def test_independent_protections_are_not_released_by_another_reset(tmp_path=None
                discharge_feedback=False)
     )
     reset = controller.request_reset(2.0)
-    assert reset[0].reasons == ("over_temperature",)
+    assert set(reset[0].reasons) == {
+        "over_temperature",
+        "post_disconnect_voltage_verification",
+    }
     assert controller.charge_contactor_closed is False
     assert "over_voltage" in controller.active_reasons
 
