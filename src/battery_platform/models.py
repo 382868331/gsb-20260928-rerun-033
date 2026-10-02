@@ -24,6 +24,8 @@ class Measurement:
     charge_contactor_feedback: bool | None = None
     discharge_contactor_feedback: bool | None = None
     load_voltage: float | None = None
+    charge_contactor_component_id: str | None = None
+    discharge_contactor_component_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -33,6 +35,8 @@ class Measurement:
             "charge_contactor_feedback": self.charge_contactor_feedback,
             "discharge_contactor_feedback": self.discharge_contactor_feedback,
             "load_voltage": self.load_voltage,
+            "charge_contactor_component_id": self.charge_contactor_component_id,
+            "discharge_contactor_component_id": self.discharge_contactor_component_id,
         }
 
 

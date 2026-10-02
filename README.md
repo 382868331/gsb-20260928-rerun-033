@@ -39,12 +39,28 @@
   仍保持锁定。
 - 等待确认期间命令再次变化（如中途重开/重合）会清空已等待时间，必要等待不得被
   缩短。
+- 更换接触器不是改显示名称：`register_contactor_replacement(contactor_name, new_component_id, timestamp)`
+  会登记位置上的新部件代次，重置该位置当前部件的不匹配状态，并保留旧部件 ID、安装/
+  更换时间、已确认粘连、恢复计时和迟到反馈。当前上电许可只依据当前部件反馈；旧故障
+  不会无条件套到新部件，也不能用另一只部件的正常反馈解除当前限制。
+- 更换后原断开验证的双反馈和持续低压计时作废，重新从新部件反馈开始。只有当前两只
+  接触器都反馈断开、负载侧低压持续达到 `post_disconnect_voltage.recovery_delay`，且
+  没有其它位置的当前故障，才允许人工复位后再次上电。
+- 样本可携带 `charge_contactor_component_id` / `discharge_contactor_component_id`；
+  来自已更换旧 ID 的反馈记录为 `stale_contactor_feedback_ignored`，只追加到旧部件
+  履历，不改变当前部件的物理观测和恢复计时。
+- `withdraw_contactor_replacement(contactor_name, timestamp)` 用于撤回误登记的更换
+  说明。误登记部件保留为 `withdrawn` 履历，此前命令仍作为历史事实；当前有效部件
+  恢复为旧部件，并恢复更换登记时保存的旧部件故障/恢复状态，后续决定重新说明依据。
 - 不一致故障同样锁定：反馈恢复一致并持续 `recovery_delay` 后仅允许人工复位；
   期间短暂恢复会重新计时。复位时只要其它保护仍有效，对应接触器就不会恢复闭合。
 - `VirtualContactor` 用虚拟时间模拟动作延迟、抖动与卡死；接触器请求与观察状态都
   写入快照，重新上电后可继续核对不一致故障的锁定与复位前置条件。
 - 每次更新后可调用 `JsonlEventRecorder.record_controller_state()` 保存触发和恢复计时器；
   `restore_controller()` 用最后快照跨重启续跑，`replay_recording()` 则从首个样本重建并逐时刻核对事件、接触器和人工复位许可。
+- 人工登记可使用 `record_contactor_replacement()` 与
+  `record_contactor_replacement_withdrawal()`；事件和最新部件代次都会进入 JSONL，
+  重开后仍能追溯每次许可、拒绝、复位以及当时有效的部件和观测。
 
 ## 测试配置
 

@@ -82,6 +82,38 @@ def test_recording_replays_per_sample_permissions_across_restart(tmp_path):
         "discharge_contactor_closed": False,
         "charge_contactor_observed_closed": None,
         "discharge_contactor_observed_closed": None,
+        "charge_contactor_component_id": "charge:original",
+        "discharge_contactor_component_id": "discharge:original",
+        "contactor_components": {
+            "charge": {
+                "current_component_id": "charge:original",
+                "components": [
+                    {
+                        "component_id": "charge:original",
+                        "installed_at": 0.0,
+                        "replaced_at": None,
+                        "status": "installed",
+                        "note": "original component",
+                        "fault_active": False,
+                        "fault_locked": False,
+                    }
+                ],
+            },
+            "discharge": {
+                "current_component_id": "discharge:original",
+                "components": [
+                    {
+                        "component_id": "discharge:original",
+                        "installed_at": 0.0,
+                        "replaced_at": None,
+                        "status": "installed",
+                        "note": "original component",
+                        "fault_active": False,
+                        "fault_locked": False,
+                    }
+                ],
+            },
+        },
         "active_reasons": (
             "over_voltage",
             "measurement_fault",

@@ -33,6 +33,37 @@ class JsonlEventRecorder:
         self.record_controller_state(controller)
         return events
 
+    def record_contactor_replacement(
+        self,
+        controller: ProtectionController,
+        contactor_name: str,
+        new_component_id: str,
+        timestamp: float | None = None,
+        *,
+        note: str = "",
+    ) -> list[ProtectionEvent]:
+        events = controller.register_contactor_replacement(
+            contactor_name, new_component_id, timestamp, note=note
+        )
+        self.record_events(events)
+        self.record_controller_state(controller)
+        return events
+
+    def record_contactor_replacement_withdrawal(
+        self,
+        controller: ProtectionController,
+        contactor_name: str,
+        timestamp: float | None = None,
+        *,
+        reason: str = "replacement registered in error",
+    ) -> list[ProtectionEvent]:
+        events = controller.withdraw_contactor_replacement(
+            contactor_name, timestamp, reason=reason
+        )
+        self.record_events(events)
+        self.record_controller_state(controller)
+        return events
+
     def _write(self, payload: dict[str, object]) -> None:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -74,6 +105,12 @@ def replay_recording(
                 discharge_contactor_feedback=row.get(
                     "discharge_contactor_feedback"
                 ),
+                charge_contactor_component_id=row.get(
+                    "charge_contactor_component_id"
+                ),
+                discharge_contactor_component_id=row.get(
+                    "discharge_contactor_component_id"
+                ),
                 load_voltage=row.get("load_voltage"),
             )
             produced = controller.update(measurement)
@@ -93,9 +130,26 @@ def replay_recording(
             "manual_reset",
             "reset_blocked",
             "reset_idle",
+            "contactor_replacement_registered",
+            "contactor_replacement_withdrawn",
+            "stale_contactor_feedback_ignored",
         }:
             timestamp = float(row["timestamp"])
-            produced = controller.request_reset(timestamp)
+            if row["event_type"] == "contactor_replacement_registered":
+                produced = controller.register_contactor_replacement(
+                    str(row["details"]["contactor"]),
+                    str(row["details"]["new_component_id"]),
+                    timestamp,
+                    note=str(row["details"].get("note", "")),
+                )
+            elif row["event_type"] == "contactor_replacement_withdrawn":
+                produced = controller.withdraw_contactor_replacement(
+                    str(row["details"]["contactor"]),
+                    timestamp,
+                    reason=str(row["details"].get("reason", "")),
+                )
+            else:
+                produced = controller.request_reset(timestamp)
             actual = [event.to_dict() for event in produced]
             if actual != [
                 {key: value for key, value in row.items() if key != "record"}
@@ -119,7 +173,13 @@ def _take_following_events(
         index < len(rows)
         and rows[index]["record"] == "event"
         and rows[index]["event_type"]
-        not in {"manual_reset", "reset_blocked", "reset_idle"}
+        not in {
+            "manual_reset",
+            "reset_blocked",
+            "reset_idle",
+            "contactor_replacement_registered",
+            "contactor_replacement_withdrawn",
+        }
     ):
         events.append(rows[index])
         index += 1
@@ -139,6 +199,13 @@ def _trace_point(
         "discharge_contactor_observed_closed": (
             controller.discharge_contactor_observed_closed
         ),
+        "charge_contactor_component_id": (
+            controller.contactor_components["charge"]["current_component_id"]
+        ),
+        "discharge_contactor_component_id": (
+            controller.contactor_components["discharge"]["current_component_id"]
+        ),
+        "contactor_components": controller.contactor_components,
         "active_reasons": controller.active_reasons,
         "reset_ready_reasons": controller.reset_ready_reasons,
         "reset_blocked_reasons": controller.reset_blocked_reasons,

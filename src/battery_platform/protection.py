@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 from .models import Measurement, ProtectionEvent
@@ -72,6 +72,7 @@ class _FaultState:
 
 @dataclass
 class _ContactorState:
+    component_id: str = ""
     requested_closed: bool | None = None
     requested_since: float | None = None
     observed_closed: bool | None = None
@@ -79,6 +80,22 @@ class _ContactorState:
     mismatch: bool = False
     mismatch_since: float | None = None
     recovery_candidate_since: float | None = None
+
+
+@dataclass
+class _ComponentRecord:
+    component_id: str
+    contactor_name: str
+    installed_at: float
+    replaced_at: float | None = None
+    fault_state: _FaultState | None = None
+    status: str = "installed"
+    note: str = ""
+    last_requested_closed: bool | None = None
+    last_requested_since: float | None = None
+    last_observed_closed: bool | None = None
+    last_observed_since: float | None = None
+    mismatch_since: float | None = None
 
 
 @dataclass
@@ -128,8 +145,23 @@ class ProtectionController:
             )
         }
         self._contactors = {
-            "charge": _ContactorState(),
-            "discharge": _ContactorState(),
+            "charge": _ContactorState(component_id="charge:original"),
+            "discharge": _ContactorState(component_id="discharge:original"),
+        }
+        self._component_records = {
+            "charge": [
+                _ComponentRecord(
+                    "charge:original", "charge", 0.0, note="original component"
+                )
+            ],
+            "discharge": [
+                _ComponentRecord(
+                    "discharge:original",
+                    "discharge",
+                    0.0,
+                    note="original component",
+                )
+            ],
         }
         self._disconnect_verification = _DisconnectVerification()
         self.events: list[ProtectionEvent] = []
@@ -179,6 +211,35 @@ class ProtectionController:
             if name.endswith("_contactor_mismatch")
             and (state.active or state.locked)
         )
+
+    @property
+    def contactor_components(self) -> dict[str, dict[str, object]]:
+        return {
+            name: {
+                "current_component_id": contactor.component_id,
+                "components": [
+                    {
+                        "component_id": record.component_id,
+                        "installed_at": record.installed_at,
+                        "replaced_at": record.replaced_at,
+                        "status": record.status,
+                        "note": record.note,
+                        "fault_active": bool(
+                            record.fault_state
+                            and (
+                                record.fault_state.active
+                                or record.fault_state.locked
+                            )
+                        ),
+                        "fault_locked": bool(
+                            record.fault_state and record.fault_state.locked
+                        ),
+                    }
+                    for record in self._component_records[name]
+                ],
+            }
+            for name, contactor in self._contactors.items()
+        }
 
     @property
     def active_reasons(self) -> tuple[str, ...]:
@@ -244,7 +305,14 @@ class ProtectionController:
             ("discharge", measurement.discharge_contactor_feedback),
         ):
             event = self._update_contactor_feedback(
-                contactor_name, observed, measurement.timestamp
+                contactor_name,
+                observed,
+                measurement.timestamp,
+                getattr(
+                    measurement,
+                    f"{contactor_name}_contactor_component_id",
+                    None,
+                ),
             )
             if event is not None:
                 produced.append(event)
@@ -277,6 +345,7 @@ class ProtectionController:
         reset_timestamp = self.current_timestamp if timestamp is None else timestamp
         if reset_timestamp is None:
             raise ValueError("timestamp is required before the first reset")
+        self.current_timestamp = reset_timestamp
 
         reset_names = []
         blocked = []
@@ -333,6 +402,184 @@ class ProtectionController:
     def replay(self) -> list[ProtectionEvent]:
         return list(self.events)
 
+    def register_contactor_replacement(
+        self,
+        contactor_name: str,
+        new_component_id: str,
+        timestamp: float | None = None,
+        *,
+        note: str = "",
+    ) -> list[ProtectionEvent]:
+        name = self._contactor_name(contactor_name)
+        component_id = str(new_component_id).strip()
+        if not component_id:
+            raise ValueError("component_id is required")
+        event_timestamp = self.current_timestamp if timestamp is None else timestamp
+        if event_timestamp is None:
+            raise ValueError("timestamp is required before the first replacement")
+        registered_ids = {
+            record.component_id
+            for records in self._component_records.values()
+            for record in records
+        }
+        if component_id in registered_ids:
+            raise ValueError(f"component {component_id} is already registered")
+
+        self.current_timestamp = event_timestamp
+        contactor = self._contactors[name]
+        previous_id = contactor.component_id
+        previous_record = self._component_records[name][-1]
+        previous_record.replaced_at = event_timestamp
+        previous_record.status = "replaced"
+        previous_record.fault_state = self._copy_fault_state(
+            self._states[f"{name}_contactor_mismatch"]
+        )
+        previous_record.note = previous_record.note or note
+        previous_record.last_requested_closed = contactor.requested_closed
+        previous_record.last_requested_since = contactor.requested_since
+        previous_record.last_observed_closed = contactor.observed_closed
+        previous_record.last_observed_since = contactor.observed_since
+        previous_record.mismatch_since = contactor.mismatch_since
+
+        self._component_records[name].append(
+            _ComponentRecord(
+                component_id,
+                name,
+                event_timestamp,
+                note=note,
+            )
+        )
+        self._reset_current_contactor_component(name, component_id, event_timestamp)
+        self._reset_verification_for_replacement(
+            f"waiting_for_new_component_feedback:{name}"
+        )
+        self._dispatch_contactor_commands(event_timestamp)
+
+        event = self._make_event(
+            "contactor_replacement_registered",
+            reasons=(),
+            details={
+                "contactor": name,
+                "previous_component_id": previous_id,
+                "new_component_id": component_id,
+                "replaced_at": event_timestamp,
+                "note": note,
+                "retained_component_records": self.contactor_components[name]["components"],
+                "recovery_basis": self._recovery_summary(),
+            },
+        )
+        self.events.append(event)
+        return [event]
+
+    def withdraw_contactor_replacement(
+        self,
+        contactor_name: str,
+        timestamp: float | None = None,
+        *,
+        reason: str = "replacement registered in error",
+    ) -> list[ProtectionEvent]:
+        name = self._contactor_name(contactor_name)
+        event_timestamp = self.current_timestamp if timestamp is None else timestamp
+        if event_timestamp is None:
+            raise ValueError("timestamp is required before withdrawing a replacement")
+        records = self._component_records[name]
+        if len(records) < 2:
+            raise ValueError("no replacement can be withdrawn for this contactor")
+
+        self.current_timestamp = event_timestamp
+        active_records = [
+            record for record in records if record.status != "withdrawn"
+        ]
+        if len(active_records) < 2:
+            raise ValueError("no replacement can be withdrawn for this contactor")
+        mistaken_record = active_records[-1]
+        mistaken_record.replaced_at = event_timestamp
+        mistaken_record.status = "withdrawn"
+        restored_record = active_records[-2]
+        restored_record.replaced_at = None
+        restored_record.status = "installed"
+        contactor = self._contactors[name]
+        previous_component_id = contactor.component_id
+        contactor.component_id = restored_record.component_id
+        self._reset_current_contactor_component(
+            name, restored_record.component_id, contactor.requested_since
+        )
+        if restored_record.fault_state is not None:
+            self._restore_fault_state(
+                f"{name}_contactor_mismatch",
+                restored_record.fault_state,
+            )
+        self._reset_verification_for_replacement(
+            f"replacement_withdrawn:{name}"
+        )
+        self._dispatch_contactor_commands(event_timestamp)
+
+        event = self._make_event(
+            "contactor_replacement_withdrawn",
+            reasons=(),
+            details={
+                "contactor": name,
+                "withdrawn_component_id": mistaken_record.component_id,
+                "restored_component_id": restored_record.component_id,
+                "previous_component_id": previous_component_id,
+                "withdrawn_at": event_timestamp,
+                "reason": reason,
+                "issued_commands_remain_historical_facts": True,
+                "recovery_basis": self._recovery_summary(),
+            },
+        )
+        self.events.append(event)
+        return [event]
+
+    def _contactor_name(self, contactor_name: str) -> str:
+        aliases = {
+            "charge": "charge",
+            "charge_contactor": "charge",
+            "charging": "charge",
+            "discharge": "discharge",
+            "discharge_contactor": "discharge",
+            "discharging": "discharge",
+        }
+        normalized = aliases.get(str(contactor_name).strip().lower())
+        if normalized is None:
+            raise ValueError("contactor_name must be 'charge' or 'discharge'")
+        return normalized
+
+    def _copy_fault_state(self, state: _FaultState) -> _FaultState:
+        return replace(state)
+
+    def _restore_fault_state(
+        self, name: str, saved_state: _FaultState
+    ) -> None:
+        self._states[name] = replace(saved_state)
+
+    def _reset_current_contactor_component(
+        self,
+        name: str,
+        component_id: str,
+        timestamp: float | None,
+    ) -> None:
+        mismatch_name = f"{name}_contactor_mismatch"
+        self._states[mismatch_name] = _FaultState(
+            source=f"{name}_contactor_feedback:component={component_id}"
+        )
+        self._contactors[name] = _ContactorState(
+            component_id=component_id,
+            requested_since=timestamp,
+        )
+
+    def _reset_verification_for_replacement(self, reason: str) -> None:
+        verification = self._disconnect_verification
+        verification.required = True
+        verification.active = True
+        verification.locked = True
+        verification.recovery_ready = False
+        verification.both_open_since = None
+        verification.low_voltage_since = None
+        verification.failure_reason = reason
+        verification.actual_disconnect_contactor = None
+        verification.low_voltage_observed = False
+
     def state_snapshot(self) -> dict[str, object]:
         verification = self._disconnect_verification
         return {
@@ -352,6 +599,7 @@ class ProtectionController:
             },
             "contactors": {
                 name: {
+                    "component_id": contactor.component_id,
                     "requested_closed": contactor.requested_closed,
                     "requested_since": contactor.requested_since,
                     "observed_closed": contactor.observed_closed,
@@ -361,6 +609,26 @@ class ProtectionController:
                     "recovery_candidate_since": contactor.recovery_candidate_since,
                 }
                 for name, contactor in self._contactors.items()
+            },
+            "component_records": {
+                name: [
+                    {
+                        "component_id": record.component_id,
+                        "contactor_name": record.contactor_name,
+                        "installed_at": record.installed_at,
+                        "replaced_at": record.replaced_at,
+                        "status": record.status,
+                        "note": record.note,
+                        "last_requested_closed": record.last_requested_closed,
+                        "last_requested_since": record.last_requested_since,
+                        "last_observed_closed": record.last_observed_closed,
+                        "last_observed_since": record.last_observed_since,
+                        "mismatch_since": record.mismatch_since,
+                        "fault_state": self._fault_state_payload(record.fault_state),
+                    }
+                    for record in records
+                ]
+                for name, records in self._component_records.items()
             },
             "disconnect_verification": {
                 "required": verification.required,
@@ -412,7 +680,43 @@ class ProtectionController:
                     "mismatch_since",
                     "recovery_candidate_since",
                 ):
-                    setattr(contactor, field_name, payload[field_name])
+                    setattr(
+                        contactor,
+                        field_name,
+                        payload.get(field_name, getattr(contactor, field_name)),
+                    )
+                contactor.component_id = str(
+                    payload.get("component_id", contactor.component_id)
+                )
+        component_records = snapshot.get("component_records")
+        if isinstance(component_records, dict):
+            self._component_records = {}
+            for name, payloads in component_records.items():
+                assert isinstance(payloads, list)
+                records = []
+                for payload in payloads:
+                    assert isinstance(payload, dict)
+                    fault_payload = payload.get("fault_state")
+                    fault_state = None
+                    if isinstance(fault_payload, dict):
+                        fault_state = self._fault_state_from_payload(fault_payload)
+                    records.append(
+                        _ComponentRecord(
+                            component_id=str(payload["component_id"]),
+                            contactor_name=str(payload["contactor_name"]),
+                            installed_at=float(payload["installed_at"]),
+                            replaced_at=payload["replaced_at"],
+                            status=str(payload["status"]),
+                            note=str(payload.get("note", "")),
+                            last_requested_closed=payload.get("last_requested_closed"),
+                            last_requested_since=payload.get("last_requested_since"),
+                            last_observed_closed=payload.get("last_observed_closed"),
+                            last_observed_since=payload.get("last_observed_since"),
+                            mismatch_since=payload.get("mismatch_since"),
+                            fault_state=fault_state,
+                        )
+                    )
+                self._component_records[name] = records
         verification_payload = snapshot.get("disconnect_verification")
         if isinstance(verification_payload, dict):
             for field_name in (
@@ -433,6 +737,34 @@ class ProtectionController:
                     field_name,
                     verification_payload.get(field_name, getattr(verification, field_name)),
                 )
+
+    def _fault_state_payload(
+        self, state: _FaultState | None
+    ) -> dict[str, object] | None:
+        if state is None:
+            return None
+        return {
+            "observed": state.observed,
+            "candidate_since": state.candidate_since,
+            "active": state.active,
+            "recovery_candidate_since": state.recovery_candidate_since,
+            "recovery_ready": state.recovery_ready,
+            "locked": state.locked,
+            "last_value": state.last_value,
+            "source": state.source,
+        }
+
+    def _fault_state_from_payload(self, payload: dict[str, object]) -> _FaultState:
+        return _FaultState(
+            observed=bool(payload["observed"]),
+            candidate_since=payload["candidate_since"],  # type: ignore[arg-type]
+            active=bool(payload["active"]),
+            recovery_candidate_since=payload["recovery_candidate_since"],  # type: ignore[arg-type]
+            recovery_ready=bool(payload["recovery_ready"]),
+            locked=bool(payload["locked"]),
+            last_value=payload["last_value"],  # type: ignore[arg-type]
+            source=str(payload["source"]),
+        )
 
     def _observe(self, measurement: Measurement) -> dict[str, bool]:
         states = {name: False for name in self._states}
@@ -643,8 +975,19 @@ class ProtectionController:
         contactor_name: str,
         observed_closed: bool | None,
         timestamp: float,
+        observed_component_id: str | None = None,
     ) -> ProtectionEvent | None:
         contactor = self._contactors[contactor_name]
+        if (
+            observed_component_id is not None
+            and str(observed_component_id) != contactor.component_id
+        ):
+            return self._stale_component_feedback_event(
+                contactor_name,
+                str(observed_component_id),
+                observed_closed,
+                timestamp,
+            )
         previous_observed = contactor.observed_closed
         contactor.observed_closed = observed_closed
         if observed_closed != previous_observed:
@@ -663,7 +1006,8 @@ class ProtectionController:
         state.last_value = 1.0 if observed_closed else 0.0
         state.source = (
             f"{contactor_name}_contactor_feedback"
-            f"(requested={contactor.requested_closed},"
+            f"(component={contactor.component_id},"
+            f" requested={contactor.requested_closed},"
             f" observed={observed_closed})"
         )
 
@@ -724,6 +1068,33 @@ class ProtectionController:
             mismatch_name,
             contactor_name,
             observed_closed,
+        )
+
+    def _stale_component_feedback_event(
+        self,
+        contactor_name: str,
+        observed_component_id: str,
+        observed_closed: bool | None,
+        timestamp: float,
+    ) -> ProtectionEvent:
+        for record in reversed(self._component_records[contactor_name]):
+            if record.component_id == observed_component_id:
+                record.last_observed_closed = observed_closed
+                record.last_observed_since = timestamp
+                record.status = "historical_feedback_received"
+                break
+        return self._make_event(
+            "stale_contactor_feedback_ignored",
+            reasons=(),
+            details={
+                "contactor": contactor_name,
+                "current_component_id": self._contactors[contactor_name].component_id,
+                "observed_component_id": observed_component_id,
+                "observed_closed": observed_closed,
+                "observed_at": timestamp,
+                "decision_scope": "historical_component_evidence",
+                "current_component_unchanged": True,
+            },
         )
 
     def _update_disconnect_verification(
@@ -860,6 +1231,10 @@ class ProtectionController:
             "discharge_feedback": (
                 self._contactors["discharge"].observed_closed
             ),
+            "charge_component_id": self._contactors["charge"].component_id,
+            "discharge_component_id": (
+                self._contactors["discharge"].component_id
+            ),
         }
         return self._make_event(
             event_type,
@@ -879,6 +1254,7 @@ class ProtectionController:
         details = {
             "action": self._ACTIONS[name],
             "source": f"{contactor_name}_contactor_feedback",
+            "component_id": contactor.component_id,
             "requested_closed": contactor.requested_closed,
             "observed_closed": observed_closed,
             "trigger_threshold": rule.trigger_threshold,
@@ -941,6 +1317,12 @@ class ProtectionController:
                 ),
                 "discharge_feedback_closed": (
                     self._contactors["discharge"].observed_closed
+                ),
+                "charge_component_id": (
+                    self._contactors["charge"].component_id
+                ),
+                "discharge_component_id": (
+                    self._contactors["discharge"].component_id
                 ),
                 "load_voltage": self.current_load_voltage,
             },
