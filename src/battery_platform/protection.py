@@ -34,6 +34,9 @@ class ProtectionConfig:
     contactor_mismatch: FaultRule = field(
         default_factory=lambda: FaultRule(None, None, 0.5, 1.0)
     )
+    post_open_verification: FaultRule = field(
+        default_factory=lambda: FaultRule(0.5, None, 1.0, 0.5)
+    )
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "ProtectionConfig":
@@ -43,6 +46,7 @@ class ProtectionConfig:
             "over_temperature",
             "measurement_fault",
             "contactor_mismatch",
+            "post_open_verification",
         )
         kwargs: dict[str, object] = {}
         if "expected_cells" in payload:
@@ -70,9 +74,27 @@ class _FaultState:
 class _ContactorState:
     requested_closed: bool | None = None
     observed_closed: bool | None = None
+    open_confirmed: bool = False
     mismatch: bool = False
     mismatch_since: float | None = None
     recovery_candidate_since: float | None = None
+
+
+@dataclass
+class _VerificationState:
+    """Post-open verification: prove the bus really de-energised.
+
+    elapsed banks confirmed de-energised observation time so a
+    mid-verification re-close pauses the wait instead of resetting it.
+    """
+
+    required: bool = False
+    verifying: bool = False
+    passed: bool = False
+    elapsed: float = 0.0
+    good_since: float | None = None
+    pending_reasons: list[str] = field(default_factory=list)
+    last_bus_voltage: float | None = None
 
 
 class ProtectionController:
@@ -85,6 +107,7 @@ class ProtectionController:
         "measurement_fault": "open_both_contactors",
         "charge_contactor_mismatch": "open_both_contactors",
         "discharge_contactor_mismatch": "open_both_contactors",
+        "feedback_contradiction": "open_both_contactors",
     }
     _CONTACTOR_EFFECT: ClassVar[dict[str, tuple[bool, bool]]] = {
         "open_charge_contactor": (True, False),
@@ -103,12 +126,14 @@ class ProtectionController:
                 "measurement_fault",
                 "charge_contactor_mismatch",
                 "discharge_contactor_mismatch",
+                "feedback_contradiction",
             )
         }
         self._contactors = {
             "charge": _ContactorState(),
             "discharge": _ContactorState(),
         }
+        self._verification = _VerificationState()
         self.events: list[ProtectionEvent] = []
         self.current_timestamp: float | None = None
 
@@ -127,6 +152,40 @@ class ProtectionController:
     @property
     def discharge_contactor_observed_closed(self) -> bool | None:
         return self._contactors["discharge"].observed_closed
+
+    @property
+    def disconnect_completed_by(self) -> tuple[str, ...]:
+        """Poles that physically opened after being commanded open."""
+
+        return tuple(
+            name
+            for name, contactor in self._contactors.items()
+            if contactor.requested_closed is False and contactor.open_confirmed
+        )
+
+    @property
+    def verification_status(self) -> dict[str, object]:
+        verification = self._verification
+        elapsed = verification.elapsed
+        if (
+            verification.good_since is not None
+            and self.current_timestamp is not None
+        ):
+            elapsed += self.current_timestamp - verification.good_since
+        return {
+            "required": verification.required,
+            "verifying": verification.verifying,
+            "passed": verification.passed,
+            "elapsed": elapsed,
+            "pending_reasons": list(verification.pending_reasons),
+            "last_bus_voltage": verification.last_bus_voltage,
+            "repower_allowed": self.repower_allowed,
+        }
+
+    @property
+    def repower_allowed(self) -> bool:
+        verification = self._verification
+        return not verification.required or verification.passed
 
     @property
     def contactor_mismatch_reasons(self) -> tuple[str, ...]:
@@ -185,14 +244,26 @@ class ProtectionController:
             ("charge", measurement.charge_contactor_feedback),
             ("discharge", measurement.discharge_contactor_feedback),
         ):
-            event = self._update_contactor_feedback(
+            produced.extend(
+                self._update_contactor_feedback(
                 contactor_name, observed, measurement.timestamp
+                )
             )
-            if event is not None:
-                produced.append(event)
+
+        contradiction_event = self._update_fault(
+            "feedback_contradiction",
+            self._observe_contradiction(),
+            measurement.timestamp,
+        )
+        if contradiction_event is not None:
+            produced.append(contradiction_event)
 
         # A newly confirmed mismatch forces the opposite pole open as well.
         self._dispatch_contactor_commands()
+
+        produced.extend(
+            self._update_verification(measurement, measurement.timestamp)
+        )
 
         after_charge = self.charge_contactor_closed
         after_discharge = self.discharge_contactor_closed
@@ -241,6 +312,12 @@ class ProtectionController:
             reset_names.append(name)
 
         details: dict[str, object] = {"reset_reasons": reset_names}
+        verification = self._verification
+        details["verification"] = self.verification_status
+        if verification.verifying and not verification.passed:
+            # Manual reset never substitutes for an incomplete verification.
+            details["verification_blocking"] = True
+            blocked = blocked + ["post_open_verification"]
         if blocked:
             details["blocked_reasons"] = blocked
             details["recovery_conditions"] = self._recovery_summary()
@@ -275,11 +352,21 @@ class ProtectionController:
                 name: {
                     "requested_closed": contactor.requested_closed,
                     "observed_closed": contactor.observed_closed,
+                    "open_confirmed": contactor.open_confirmed,
                     "mismatch": contactor.mismatch,
                     "mismatch_since": contactor.mismatch_since,
                     "recovery_candidate_since": contactor.recovery_candidate_since,
                 }
                 for name, contactor in self._contactors.items()
+            },
+            "verification": {
+                "required": self._verification.required,
+                "verifying": self._verification.verifying,
+                "passed": self._verification.passed,
+                "elapsed": self._verification.elapsed,
+                "good_since": self._verification.good_since,
+                "pending_reasons": list(self._verification.pending_reasons),
+                "last_bus_voltage": self._verification.last_bus_voltage,
             },
         }
 
@@ -309,11 +396,26 @@ class ProtectionController:
                 for field_name in (
                     "requested_closed",
                     "observed_closed",
+                    "open_confirmed",
                     "mismatch",
                     "mismatch_since",
                     "recovery_candidate_since",
                 ):
-                    setattr(contactor, field_name, payload[field_name])
+                    if field_name in payload:
+                        setattr(contactor, field_name, payload[field_name])
+        verification = snapshot.get("verification")
+        if isinstance(verification, dict):
+            target = self._verification
+            for field_name in (
+                "required",
+                "verifying",
+                "passed",
+                "elapsed",
+                "good_since",
+                "last_bus_voltage",
+            ):
+                setattr(target, field_name, verification[field_name])
+            target.pending_reasons = list(verification["pending_reasons"])
 
     def _observe(self, measurement: Measurement) -> dict[str, bool]:
         states = {name: False for name in self._states}
@@ -392,7 +494,7 @@ class ProtectionController:
     def _update_fault(
         self, name: str, observed: bool, timestamp: float
     ) -> ProtectionEvent | None:
-        rule = getattr(self.config, name)
+        rule = self._rule_for(name)
         state = self._states[name]
 
         if observed:
@@ -470,6 +572,7 @@ class ProtectionController:
         if name in {
             "charge_contactor_mismatch",
             "discharge_contactor_mismatch",
+            "feedback_contradiction",
         }:
             return self.config.contactor_mismatch
         return getattr(self.config, name)
@@ -507,6 +610,8 @@ class ProtectionController:
             if contactor.requested_closed == requested_closed:
                 continue
             contactor.requested_closed = requested_closed
+            if requested_closed:
+                contactor.open_confirmed = False
             contactor.mismatch = False
             contactor.mismatch_since = None
             contactor.recovery_candidate_since = None
@@ -520,14 +625,33 @@ class ProtectionController:
         contactor_name: str,
         observed_closed: bool | None,
         timestamp: float,
-    ) -> ProtectionEvent | None:
+    ) -> list[ProtectionEvent]:
         contactor = self._contactors[contactor_name]
         contactor.observed_closed = observed_closed
+        events: list[ProtectionEvent] = []
+        if (
+            contactor.requested_closed is False
+            and observed_closed is False
+            and not contactor.open_confirmed
+        ):
+            contactor.open_confirmed = True
+            events.append(
+                self._make_event(
+                    "contactor_open_confirmed",
+                    reasons=(),
+                    details={
+                        "contactor": contactor_name,
+                        "requested_closed": False,
+                        "observed_closed": False,
+                        "disconnect_completed_by": contactor_name,
+                    },
+                )
+            )
         if observed_closed is None:
             contactor.mismatch = False
             contactor.mismatch_since = None
             contactor.recovery_candidate_since = None
-            return None
+            return events
 
         rule = self.config.contactor_mismatch
         mismatch_name = f"{contactor_name}_contactor_mismatch"
@@ -555,18 +679,20 @@ class ProtectionController:
                 state.active = True
                 if rule.locked:
                     state.locked = True
-                return self._mismatch_event(
-                    "protection_triggered",
-                    mismatch_name,
-                    contactor_name,
-                    observed_closed,
+                events.append(
+                    self._mismatch_event(
+                        "protection_triggered",
+                        mismatch_name,
+                        contactor_name,
+                        observed_closed,
+                    )
                 )
-            return None
+            return events
 
         contactor.mismatch = False
         contactor.mismatch_since = None
         if not state.active and not state.locked:
-            return None
+            return events
 
         state.candidate_since = None
         if contactor.recovery_candidate_since is None:
@@ -577,25 +703,174 @@ class ProtectionController:
             < rule.recovery_delay
             or state.recovery_ready
         ):
-            return None
+            return events
 
         state.active = False
         contactor.recovery_candidate_since = None
         if state.locked:
             state.recovery_ready = True
-            return self._mismatch_event(
-                "recovery_ready_manual_reset_required",
+            events.append(
+                self._mismatch_event(
+                    "recovery_ready_manual_reset_required",
+                    mismatch_name,
+                    contactor_name,
+                    observed_closed,
+                )
+            )
+            return events
+
+        state.recovery_ready = False
+        events.append(
+            self._mismatch_event(
+                "protection_released",
                 mismatch_name,
                 contactor_name,
                 observed_closed,
             )
+        )
+        return events
 
-        state.recovery_ready = False
-        return self._mismatch_event(
-            "protection_released",
-            mismatch_name,
-            contactor_name,
-            observed_closed,
+    def _observe_contradiction(self) -> bool:
+        """The two series poles report mutually exclusive physical states.
+
+        Distinct from a per-pole mismatch: even if each pole is debounced
+        against its own command, the pair of feedbacks cannot describe a
+        sane series path while they disagree under a shared command.
+        """
+
+        charge = self._contactors["charge"]
+        discharge = self._contactors["discharge"]
+        state = self._states["feedback_contradiction"]
+        if (
+            charge.requested_closed is None
+            or charge.requested_closed != discharge.requested_closed
+            or charge.observed_closed is None
+            or discharge.observed_closed is None
+        ):
+            state.last_value = None
+            state.source = "contactor_feedback_unavailable"
+            return False
+        contradictory = charge.observed_closed != discharge.observed_closed
+        state.last_value = 1.0 if contradictory else 0.0
+        state.source = (
+            "charge_contactor_feedback="
+            f"{charge.observed_closed},"
+            f" discharge_contactor_feedback={discharge.observed_closed}"
+        )
+        return contradictory
+
+    def _update_verification(
+        self, measurement: Measurement, timestamp: float
+    ) -> list[ProtectionEvent]:
+        verification = self._verification
+        rule = self.config.post_open_verification
+        events: list[ProtectionEvent] = []
+        both_requested_open = all(
+            contactor.requested_closed is False
+            for contactor in self._contactors.values()
+        )
+        both_observed_open = all(
+            contactor.observed_closed is False
+            for contactor in self._contactors.values()
+        )
+
+        if not both_requested_open:
+            # Re-closed (or never opened): pause the wait, keep banked time.
+            self._bank_good_time(timestamp)
+            if verification.passed:
+                self._verification = _VerificationState()
+            return events
+
+        verification.required = True
+        if not both_observed_open:
+            self._bank_good_time(timestamp)
+            return events
+
+        if not verification.verifying:
+            verification.verifying = True
+            events.append(
+                self._verification_event(
+                    "verification_started",
+                    {"both_contactors_reported_open": True},
+                )
+            )
+
+        bus_voltage = measurement.bus_voltage
+        verification.last_bus_voltage = bus_voltage
+        threshold = rule.trigger_threshold
+        if bus_voltage is None:
+            self._bank_good_time(timestamp)
+            events.extend(
+                self._add_verification_reason("observation_missing")
+            )
+            return events
+        if threshold is not None and bus_voltage >= threshold:
+            had_good = (
+                verification.good_since is not None
+                or verification.elapsed > 0.0
+            )
+            self._bank_good_time(timestamp)
+            reason = "brief_recovery" if had_good else "voltage_not_decayed"
+            events.extend(self._add_verification_reason(reason))
+            return events
+
+        if verification.good_since is None:
+            verification.good_since = timestamp
+        total = verification.elapsed + (timestamp - verification.good_since)
+        if not verification.passed and total + 1e-9 >= rule.trigger_delay:
+            verification.passed = True
+            cleared = list(verification.pending_reasons)
+            verification.pending_reasons = []
+            events.append(
+                self._verification_event(
+                    "verification_passed",
+                    {
+                        "observed_bus_voltage": bus_voltage,
+                        "voltage_threshold": threshold,
+                        "required_delay": rule.trigger_delay,
+                        "observed_delay": total,
+                        "cleared_reasons": cleared,
+                        "repower_allowed": True,
+                    },
+                )
+            )
+        return events
+
+    def _bank_good_time(self, timestamp: float) -> None:
+        verification = self._verification
+        if verification.good_since is not None:
+            verification.elapsed += timestamp - verification.good_since
+            verification.good_since = None
+
+    def _add_verification_reason(self, reason: str) -> list[ProtectionEvent]:
+        verification = self._verification
+        if reason in verification.pending_reasons:
+            return []
+        verification.pending_reasons.append(reason)
+        return [
+            self._verification_event(
+                "verification_pending",
+                {
+                    "reason": reason,
+                    "pending_reasons": list(verification.pending_reasons),
+                    "last_bus_voltage": verification.last_bus_voltage,
+                    "voltage_threshold": (
+                        self.config.post_open_verification.trigger_threshold
+                    ),
+                },
+            )
+        ]
+
+    def _verification_event(
+        self, event_type: str, extra_details: dict[str, object]
+    ) -> ProtectionEvent:
+        details: dict[str, object] = {
+            "action": "hold_open_until_verified",
+            "source": "bus_voltage",
+        }
+        details.update(extra_details)
+        return self._make_event(
+            event_type, reasons=("post_open_verification",), details=details
         )
 
     def _mismatch_event(
@@ -627,7 +902,7 @@ class ProtectionController:
         extra_details: dict[str, object] | None = None,
     ) -> ProtectionEvent:
         state = self._states[name]
-        rule = getattr(self.config, name)
+        rule = self._rule_for(name)
         details = {
             "action": self._ACTIONS[name],
             "source": state.source,

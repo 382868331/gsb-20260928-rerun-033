@@ -67,7 +67,10 @@ def test_late_feedback_within_delay_does_not_fault():
     events = controller.update(
         sample(1.4, value=4.21, charge_feedback=False, discharge_feedback=True)
     )
-    assert events == []
+    assert [event.event_type for event in events] == [
+        "contactor_open_confirmed"
+    ]
+    assert events[0].details["disconnect_completed_by"] == "charge"
     assert mismatches(controller) == []
 
 

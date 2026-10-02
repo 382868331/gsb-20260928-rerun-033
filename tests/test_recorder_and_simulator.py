@@ -85,4 +85,14 @@ def test_recording_replays_per_sample_permissions_across_restart(tmp_path):
         "active_reasons": ("over_voltage", "measurement_fault"),
         "reset_ready_reasons": (),
         "reset_blocked_reasons": ("over_voltage", "measurement_fault"),
+        "disconnect_completed_by": (),
+        "verification": {
+            "required": True,
+            "verifying": False,
+            "passed": False,
+            "elapsed": 0.0,
+            "pending_reasons": [],
+            "last_bus_voltage": None,
+            "repower_allowed": False,
+        },
     }

@@ -31,6 +31,29 @@
 - 每次更新后可调用 `JsonlEventRecorder.record_controller_state()` 保存触发和恢复计时器；
   `restore_controller()` 用最后快照跨重启续跑，`replay_recording()` 则从首个样本重建并逐时刻核对事件、接触器和人工复位许可。
 
+## 双接触器保护实验
+
+- 两只串联接触器各自动作、各自反馈：单只迟到（确认延迟内到达）不记故障；
+  单只卡住确认 `charge_/discharge_contactor_mismatch` 并锁定；
+  两只反馈互相矛盾（同一命令下报告相反状态）单独确认 `feedback_contradiction`。
+- 安全断开明确归属：`contactor_open_confirmed` 事件和 `disconnect_completed_by`
+  指出实际由哪只完成断开；另一只反馈正常不会清除已确认的粘连故障，
+  只有该极自身反馈持续健康并经人工复位才解锁。
+- `run_experiment(ExperimentScenario(...))` 可调整两级动作延迟（动作先后）与
+  `stuck` 故障注入位置，沿 JSONL 记录逐样本核对命令、反馈与母线电压依据。
+
+## 断开后验证
+
+- 两只接触器都报告断开后进入验证阶段：母线电压必须持续低于
+  `post_open_verification.trigger_threshold` 达 `trigger_delay` 才允许再次上电
+  （`repower_allowed` / `verification_passed` 事件）。
+- 电压未按预期下降、观测缺失、短暂恢复分别保留为
+  `voltage_not_decayed` / `observation_missing` / `brief_recovery`，
+  验证通过前一直留在 `verification_status.pending_reasons`。
+- 验证中途重开只暂停计时，已累计的等待保留，重新断开后继续原等待。
+- 人工复位不能略过未完成的验证：验证进行中复位被阻塞并记
+  `post_open_verification`；复位事件始终附带当前验证状态。
+
 ## 测试配置
 
 可直接在测试中构造配置，也可从字典加载：
