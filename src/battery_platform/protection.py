@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -99,6 +100,7 @@ class _DisconnectVerification:
 class ProtectionController:
     """Debounced, latching protection decision engine."""
 
+    _CONTACTOR_NAMES: ClassVar[tuple[str, ...]] = ("charge", "discharge")
     _ACTIONS: ClassVar[dict[str, str]] = {
         "over_voltage": "open_charge_contactor",
         "under_voltage": "open_discharge_contactor",
@@ -132,9 +134,18 @@ class ProtectionController:
             "discharge": _ContactorState(),
         }
         self._disconnect_verification = _DisconnectVerification()
+        self._current_parts = {
+            name: name + "-original" for name in self._CONTACTOR_NAMES
+        }
+        self._part_installed_at: dict[str, float | None] = {
+            name: None for name in self._CONTACTOR_NAMES
+        }
+        self._part_history: list[dict[str, object]] = []
+        self._replacement_log: list[dict[str, object]] = []
         self.events: list[ProtectionEvent] = []
         self.current_timestamp: float | None = None
         self.current_load_voltage: float | None = None
+        self._restored_from_snapshot = False
 
     @property
     def charge_contactor_closed(self) -> bool:
@@ -215,11 +226,12 @@ class ProtectionController:
         return tuple(reasons)
 
     def update(self, measurement: Measurement) -> list[ProtectionEvent]:
+        has_history = bool(self.events) or self._restored_from_snapshot
         before_charge = (
-            self.charge_contactor_closed if self.events else True
+            self.charge_contactor_closed if has_history else True
         )
         before_discharge = (
-            self.discharge_contactor_closed if self.events else True
+            self.discharge_contactor_closed if has_history else True
         )
         self.current_timestamp = measurement.timestamp
 
@@ -258,13 +270,13 @@ class ProtectionController:
         after_charge = self.charge_contactor_closed
         after_discharge = self.discharge_contactor_closed
         if (
-            not self.events
+            not has_history
             or before_charge != after_charge
             or before_discharge != after_discharge
         ):
             produced.append(
                 self._make_event(
-                    "contactor_state" if self.events else "initial_state",
+                    "contactor_state" if has_history else "initial_state",
                     reasons=(),
                     details=self._recovery_summary(),
                 )
@@ -333,6 +345,243 @@ class ProtectionController:
     def replay(self) -> list[ProtectionEvent]:
         return list(self.events)
 
+    @property
+    def current_parts(self) -> dict[str, str]:
+        return dict(self._current_parts)
+
+    @property
+    def part_history(self) -> list[dict[str, object]]:
+        return copy.deepcopy(self._part_history)
+
+    @property
+    def replacement_log(self) -> list[dict[str, object]]:
+        return copy.deepcopy(self._replacement_log)
+
+    def register_contactor_replacement(
+        self,
+        contactor_name: str,
+        new_part_id: str,
+        timestamp: float | None = None,
+        note: str = "",
+    ) -> ProtectionEvent:
+        """Register a physical replacement of a single contactor.
+
+        The old part keeps its confirmed faults in the part history; the new
+        part starts with a clean mismatch slate. Other faults, the other
+        contactor and any in-progress disconnect verification are untouched,
+        so the system as a whole is not declared healthy by a name swap.
+        """
+
+        if contactor_name not in self._contactors:
+            raise ValueError("unknown contactor: " + contactor_name)
+        if not new_part_id:
+            raise ValueError("new_part_id is required")
+        event_timestamp = (
+            self.current_timestamp if timestamp is None else timestamp
+        )
+        if event_timestamp is None:
+            raise ValueError("timestamp is required before the first update")
+        old_part_id = self._current_parts[contactor_name]
+        if new_part_id == old_part_id:
+            raise ValueError("new_part_id must differ from the installed part")
+
+        mismatch_name = contactor_name + "_contactor_mismatch"
+        state = self._states[mismatch_name]
+        contactor = self._contactors[contactor_name]
+        self._part_history.append(
+            {
+                "part_id": old_part_id,
+                "contactor": contactor_name,
+                "installed_at": self._part_installed_at[contactor_name],
+                "retired_at": event_timestamp,
+                "retired_reason": "replaced",
+                "faults": (
+                    [mismatch_name] if (state.active or state.locked) else []
+                ),
+                "fault_state": {
+                    field_name: getattr(state, field_name)
+                    for field_name in (
+                        "observed",
+                        "candidate_since",
+                        "active",
+                        "recovery_candidate_since",
+                        "recovery_ready",
+                        "locked",
+                        "last_value",
+                        "source",
+                    )
+                },
+                "contactor_state": {
+                    "mismatch": contactor.mismatch,
+                    "mismatch_since": contactor.mismatch_since,
+                    "recovery_candidate_since": (
+                        contactor.recovery_candidate_since
+                    ),
+                },
+            }
+        )
+
+        verification = self._disconnect_verification
+        pre_replacement_evidence = {
+            "both_open_since": verification.both_open_since,
+            "low_voltage_since": verification.low_voltage_since,
+            "low_voltage_observed": verification.low_voltage_observed,
+            "last_voltage": verification.last_voltage,
+            "charge_feedback": self._contactors["charge"].observed_closed,
+            "discharge_feedback": (
+                self._contactors["discharge"].observed_closed
+            ),
+            "charge_part_id": self._current_parts["charge"],
+            "discharge_part_id": self._current_parts["discharge"],
+        }
+
+        state.observed = False
+        state.candidate_since = None
+        state.active = False
+        state.recovery_candidate_since = None
+        state.recovery_ready = False
+        state.locked = False
+        contactor.mismatch = False
+        contactor.mismatch_since = None
+        contactor.recovery_candidate_since = None
+
+        self._current_parts[contactor_name] = new_part_id
+        self._part_installed_at[contactor_name] = event_timestamp
+        self._replacement_log.append(
+            {
+                "kind": "replaced",
+                "contactor": contactor_name,
+                "old_part_id": old_part_id,
+                "new_part_id": new_part_id,
+                "timestamp": event_timestamp,
+                "note": note,
+                "retracted": False,
+            }
+        )
+
+        self._dispatch_contactor_commands(event_timestamp)
+        event = self._make_event(
+            "contactor_replaced",
+            reasons=(),
+            details={
+                "contactor": contactor_name,
+                "old_part_id": old_part_id,
+                "new_part_id": new_part_id,
+                "note": note,
+                "preserved_faults": self._part_history[-1]["faults"],
+                "pre_replacement_evidence": pre_replacement_evidence,
+                "remaining_active_reasons": list(self.active_reasons),
+                "remaining_reset_blocked_reasons": list(
+                    self.reset_blocked_reasons
+                ),
+            },
+        )
+        self.events.append(event)
+        return event
+
+    def retract_contactor_replacement(
+        self,
+        contactor_name: str,
+        timestamp: float | None = None,
+        reason: str = "",
+    ) -> ProtectionEvent:
+        """Withdraw a mistakenly registered replacement note.
+
+        Already issued commands and events stay in the log as facts; the old
+        part identity and its archived fault state are reinstalled, and any
+        pending recovery decision re-states its basis.
+        """
+
+        if contactor_name not in self._contactors:
+            raise ValueError("unknown contactor: " + contactor_name)
+        event_timestamp = (
+            self.current_timestamp if timestamp is None else timestamp
+        )
+        if event_timestamp is None:
+            raise ValueError("timestamp is required before the first update")
+        record = next(
+            (
+                entry
+                for entry in reversed(self._replacement_log)
+                if entry["kind"] == "replaced"
+                and entry["contactor"] == contactor_name
+                and not entry["retracted"]
+            ),
+            None,
+        )
+        if record is None:
+            raise ValueError(
+                "no active replacement registered for " + contactor_name
+            )
+        record["retracted"] = True
+
+        mismatch_name = contactor_name + "_contactor_mismatch"
+        state = self._states[mismatch_name]
+        contactor = self._contactors[contactor_name]
+        if self._current_parts[contactor_name] == record["new_part_id"]:
+            self._part_history.append(
+                {
+                    "part_id": record["new_part_id"],
+                    "contactor": contactor_name,
+                    "installed_at": self._part_installed_at[contactor_name],
+                    "retired_at": event_timestamp,
+                    "retired_reason": "replacement_retracted",
+                    "faults": (
+                        [mismatch_name]
+                        if (state.active or state.locked)
+                        else []
+                    ),
+                }
+            )
+            archived = next(
+                (
+                    entry
+                    for entry in reversed(self._part_history)
+                    if entry["part_id"] == record["old_part_id"]
+                    and entry["contactor"] == contactor_name
+                    and entry["retired_reason"] == "replaced"
+                ),
+                None,
+            )
+            if archived is not None and "fault_state" in archived:
+                for field_name, value in archived["fault_state"].items():
+                    setattr(state, field_name, value)
+                for field_name, value in archived["contactor_state"].items():
+                    setattr(contactor, field_name, value)
+            self._current_parts[contactor_name] = record["old_part_id"]
+            self._part_installed_at[contactor_name] = event_timestamp
+
+        self._replacement_log.append(
+            {
+                "kind": "retracted",
+                "contactor": contactor_name,
+                "old_part_id": record["new_part_id"],
+                "new_part_id": record["old_part_id"],
+                "timestamp": event_timestamp,
+                "note": reason,
+                "retracted": False,
+            }
+        )
+
+        self._dispatch_contactor_commands(event_timestamp)
+        event = self._make_event(
+            "contactor_replacement_retracted",
+            reasons=(),
+            details={
+                "contactor": contactor_name,
+                "reinstated_part_id": self._current_parts[contactor_name],
+                "retracted_part_id": record["new_part_id"],
+                "reason": reason,
+                "recovery_conditions": self._recovery_summary(),
+                "remaining_active_reasons": list(self.active_reasons),
+                "remaining_reset_blocked_reasons": list(
+                    self.reset_blocked_reasons
+                ),
+            },
+        )
+        self.events.append(event)
+        return event
+
     def state_snapshot(self) -> dict[str, object]:
         verification = self._disconnect_verification
         return {
@@ -377,10 +626,17 @@ class ProtectionController:
                 "last_opened_contactor": verification.last_opened_contactor,
                 "low_voltage_observed": verification.low_voltage_observed,
             },
+            "parts": {
+                "current": dict(self._current_parts),
+                "installed_at": dict(self._part_installed_at),
+                "history": copy.deepcopy(self._part_history),
+                "replacement_log": copy.deepcopy(self._replacement_log),
+            },
         }
 
     def restore_state(self, snapshot: dict[str, object]) -> None:
         self.current_timestamp = snapshot["timestamp"]  # type: ignore[assignment]
+        self._restored_from_snapshot = True
         verification = self._disconnect_verification
         states = snapshot["states"]
         assert isinstance(states, dict)
@@ -433,6 +689,24 @@ class ProtectionController:
                     field_name,
                     verification_payload.get(field_name, getattr(verification, field_name)),
                 )
+        parts_payload = snapshot.get("parts")
+        if isinstance(parts_payload, dict):
+            current = parts_payload.get("current")
+            if isinstance(current, dict):
+                for name, part_id in current.items():
+                    if name in self._current_parts:
+                        self._current_parts[name] = part_id
+            installed_at = parts_payload.get("installed_at")
+            if isinstance(installed_at, dict):
+                for name, value in installed_at.items():
+                    if name in self._part_installed_at:
+                        self._part_installed_at[name] = value
+            history = parts_payload.get("history")
+            if isinstance(history, list):
+                self._part_history = copy.deepcopy(history)
+            replacement_log = parts_payload.get("replacement_log")
+            if isinstance(replacement_log, list):
+                self._replacement_log = copy.deepcopy(replacement_log)
 
     def _observe(self, measurement: Measurement) -> dict[str, bool]:
         states = {name: False for name in self._states}
@@ -879,6 +1153,7 @@ class ProtectionController:
         details = {
             "action": self._ACTIONS[name],
             "source": f"{contactor_name}_contactor_feedback",
+            "part_id": self._current_parts[contactor_name],
             "requested_closed": contactor.requested_closed,
             "observed_closed": observed_closed,
             "trigger_threshold": rule.trigger_threshold,
@@ -943,6 +1218,8 @@ class ProtectionController:
                     self._contactors["discharge"].observed_closed
                 ),
                 "load_voltage": self.current_load_voltage,
+                "charge_part_id": self._current_parts["charge"],
+                "discharge_part_id": self._current_parts["discharge"],
             },
         )
 

@@ -46,6 +46,26 @@
 - 每次更新后可调用 `JsonlEventRecorder.record_controller_state()` 保存触发和恢复计时器；
   `restore_controller()` 用最后快照跨重启续跑，`replay_recording()` 则从首个样本重建并逐时刻核对事件、接触器和人工复位许可。
 
+## 接触器更换
+
+- `register_contactor_replacement()` 为单只接触器登记更换事件和新的部件身份
+  （`part_id`）。旧部件的粘连、矛盾反馈等已确认故障连同当时状态归档进
+  `part_history`，继续保留在原部件记录中。
+- 更换只清除该位置的进行中不一致计时，让新部件从干净状态重新核对；旧故障不会
+  无条件套在新部件上，但其它保护原因、另一只接触器的故障和断开验证都不受影响，
+  不会因为换了显示名称就把整个系统记为健康。
+- 恢复投运前沿原有断开验证继续核对：更换事件记录 `pre_replacement_evidence`，
+  之后的验证、复位与拒绝事件都带上当时有效的 `charge_part_id` /
+  `discharge_part_id`，可区分哪些证据发生在更换之前、哪些已针对新部件获得。
+  另一只接触器仍有故障或电压衰减观测不足时，即使新部件反馈正常也不得上电。
+- `retract_contactor_replacement()` 撤回一条误登记的更换说明：已发出的命令和事件
+  保留为事实，旧部件身份及其归档故障恢复生效，尚未完成的恢复决定在
+  `contactor_replacement_retracted` 事件的 `recovery_conditions` 中重新说明依据。
+- 部件身份、历史归档和更换日志都写入快照；中途重开后沿原验证阶段继续，各次上电
+  许可、人工复位及拒绝原因都能追到当时有效的部件和观测。`JsonlEventRecorder`
+  的 `record_replacement()` / `record_retraction()` 与 `replay_recording()` 支持
+  完整回放更换与撤回序列。
+
 ## 测试配置
 
 可直接在测试中构造配置，也可从字典加载：

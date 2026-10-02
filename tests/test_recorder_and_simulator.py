@@ -93,6 +93,10 @@ def test_recording_replays_per_sample_permissions_across_restart(tmp_path):
             "measurement_fault",
             "post_disconnect_voltage_verification",
         ),
+        "current_parts": {
+            "charge": "charge-original",
+            "discharge": "discharge-original",
+        },
         "post_disconnect_verification": {
             "required": True,
             "active": True,

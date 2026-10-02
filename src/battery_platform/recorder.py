@@ -33,6 +33,35 @@ class JsonlEventRecorder:
         self.record_controller_state(controller)
         return events
 
+    def record_replacement(
+        self,
+        controller: ProtectionController,
+        contactor_name: str,
+        new_part_id: str,
+        timestamp: float | None = None,
+        note: str = "",
+    ) -> ProtectionEvent:
+        event = controller.register_contactor_replacement(
+            contactor_name, new_part_id, timestamp, note
+        )
+        self.record_events([event])
+        self.record_controller_state(controller)
+        return event
+
+    def record_retraction(
+        self,
+        controller: ProtectionController,
+        contactor_name: str,
+        timestamp: float | None = None,
+        reason: str = "",
+    ) -> ProtectionEvent:
+        event = controller.retract_contactor_replacement(
+            contactor_name, timestamp, reason
+        )
+        self.record_events([event])
+        self.record_controller_state(controller)
+        return event
+
     def _write(self, payload: dict[str, object]) -> None:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -105,6 +134,40 @@ def replay_recording(
             index += 1
             continue
 
+        if row["record"] == "event" and row["event_type"] in {
+            "contactor_replaced",
+            "contactor_replacement_retracted",
+        }:
+            timestamp = float(row["timestamp"])
+            details = row["details"]
+            if row["event_type"] == "contactor_replaced":
+                produced = [
+                    controller.register_contactor_replacement(
+                        details["contactor"],
+                        details["new_part_id"],
+                        timestamp,
+                        details.get("note", ""),
+                    )
+                ]
+            else:
+                produced = [
+                    controller.retract_contactor_replacement(
+                        details["contactor"],
+                        timestamp,
+                        details.get("reason", ""),
+                    )
+                ]
+            actual = [event.to_dict() for event in produced]
+            if actual != [
+                {key: value for key, value in row.items() if key != "record"}
+            ]:
+                raise ValueError(
+                    f"recorded replacement decision diverged at t={timestamp}"
+                )
+            trace.append(_trace_point(controller, timestamp))
+            index += 1
+            continue
+
         index += 1
 
     return trace
@@ -119,7 +182,13 @@ def _take_following_events(
         index < len(rows)
         and rows[index]["record"] == "event"
         and rows[index]["event_type"]
-        not in {"manual_reset", "reset_blocked", "reset_idle"}
+        not in {
+            "manual_reset",
+            "reset_blocked",
+            "reset_idle",
+            "contactor_replaced",
+            "contactor_replacement_retracted",
+        }
     ):
         events.append(rows[index])
         index += 1
@@ -145,4 +214,5 @@ def _trace_point(
         "post_disconnect_verification": (
             controller.post_disconnect_verification
         ),
+        "current_parts": controller.current_parts,
     }
