@@ -66,6 +66,20 @@
   的 `record_replacement()` / `record_retraction()` 与 `replay_recording()` 支持
   完整回放更换与撤回序列。
 
+## 部件代际与反馈归属
+
+- `submit_contactor_feedback()` 是携带部件身份的独立反馈入口：每条反馈必须给出
+  `part_id`，控制器按代际归属后再决定是否允许影响现役状态。每次安装（含更换与
+  撤回恢复）都会推进该位置的代际计数，事件与历史条目都带 `generation`。
+- 属于现役部件的反馈正常更新观测与不一致计时；属于已退役部件的迟到反馈只追加到
+  该部件 `part_history` 条目的 `late_feedback`，绝不改动现役观测、计时窗口或
+  断开验证证据，旧件的正常值不能借道通过复位验证。
+- 无法确认归属的反馈（缺少 `part_id` 或身份未知）保留在 `pending_feedback`
+  并记录原因（`missing_part_id` / `unknown_part_id`），不影响任何保护判定。
+- 代际计数、迟到反馈归档和待定队列都写入快照；保存未验证状态后重开，反馈归属
+  与计时窗口完整续跑。`JsonlEventRecorder.record_feedback()` 与
+  `replay_recording()` 支持完整回放归属、迟到与待定反馈序列。
+
 ## 测试配置
 
 可直接在测试中构造配置，也可从字典加载：

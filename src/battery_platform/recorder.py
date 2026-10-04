@@ -62,6 +62,21 @@ class JsonlEventRecorder:
         self.record_controller_state(controller)
         return event
 
+    def record_feedback(
+        self,
+        controller: ProtectionController,
+        contactor_name: str,
+        observed_closed: bool | None,
+        part_id: str | None = None,
+        timestamp: float | None = None,
+    ) -> list[ProtectionEvent]:
+        events = controller.submit_contactor_feedback(
+            contactor_name, observed_closed, part_id, timestamp
+        )
+        self.record_events(events)
+        self.record_controller_state(controller)
+        return events
+
     def _write(self, payload: dict[str, object]) -> None:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -168,6 +183,50 @@ def replay_recording(
             index += 1
             continue
 
+        if row["record"] == "event" and row["event_type"] in {
+            "contactor_feedback_attributed",
+            "late_contactor_feedback",
+            "contactor_feedback_pending",
+        }:
+            timestamp = float(row["timestamp"])
+            details = row["details"]
+            produced = controller.submit_contactor_feedback(
+                details["contactor"],
+                details["observed_closed"],
+                details.get("part_id"),
+                timestamp,
+            )
+            expected = [row]
+            cursor = index + 1
+            while (
+                cursor < len(rows)
+                and rows[cursor]["record"] == "event"
+                and rows[cursor]["event_type"]
+                not in {
+                    "manual_reset",
+                    "reset_blocked",
+                    "reset_idle",
+                    "contactor_replaced",
+                    "contactor_replacement_retracted",
+                    "contactor_feedback_attributed",
+                    "late_contactor_feedback",
+                    "contactor_feedback_pending",
+                }
+            ):
+                expected.append(rows[cursor])
+                cursor += 1
+            actual = [event.to_dict() for event in produced]
+            if actual != [
+                {key: value for key, value in event.items() if key != "record"}
+                for event in expected
+            ]:
+                raise ValueError(
+                    f"recorded feedback decision diverged at t={timestamp}"
+                )
+            trace.append(_trace_point(controller, timestamp))
+            index = cursor
+            continue
+
         index += 1
 
     return trace
@@ -188,6 +247,9 @@ def _take_following_events(
             "reset_idle",
             "contactor_replaced",
             "contactor_replacement_retracted",
+            "contactor_feedback_attributed",
+            "late_contactor_feedback",
+            "contactor_feedback_pending",
         }
     ):
         events.append(rows[index])

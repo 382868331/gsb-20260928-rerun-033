@@ -140,8 +140,12 @@ class ProtectionController:
         self._part_installed_at: dict[str, float | None] = {
             name: None for name in self._CONTACTOR_NAMES
         }
+        self._part_generations: dict[str, int] = {
+            name: 0 for name in self._CONTACTOR_NAMES
+        }
         self._part_history: list[dict[str, object]] = []
         self._replacement_log: list[dict[str, object]] = []
+        self._pending_feedback: list[dict[str, object]] = []
         self.events: list[ProtectionEvent] = []
         self.current_timestamp: float | None = None
         self.current_load_voltage: float | None = None
@@ -357,6 +361,135 @@ class ProtectionController:
     def replacement_log(self) -> list[dict[str, object]]:
         return copy.deepcopy(self._replacement_log)
 
+    @property
+    def part_generations(self) -> dict[str, int]:
+        return dict(self._part_generations)
+
+    @property
+    def pending_feedback(self) -> list[dict[str, object]]:
+        return copy.deepcopy(self._pending_feedback)
+
+    def submit_contactor_feedback(
+        self,
+        contactor_name: str,
+        observed_closed: bool | None,
+        part_id: str | None = None,
+        timestamp: float | None = None,
+    ) -> list[ProtectionEvent]:
+        # Submit one contactor feedback sample with an explicit part identity.
+        # Each installation establishes a generation for the position; feedback
+        # is attributed by part_id before it may touch live state:
+        # - the currently installed part updates live contactor state and
+        #   mismatch timing for that generation;
+        # - a retired part only appends late evidence to its part_history
+        #   entry, so a late report can never pollute the new part, cancel its
+        #   mismatch timing or satisfy the disconnect verification;
+        # - anything else stays in pending_feedback with a reason.
+        if contactor_name not in self._contactors:
+            raise ValueError("unknown contactor: " + contactor_name)
+        event_timestamp = (
+            self.current_timestamp if timestamp is None else timestamp
+        )
+        if event_timestamp is None:
+            raise ValueError("timestamp is required before the first update")
+        self.current_timestamp = event_timestamp
+
+        current_part_id = self._current_parts[contactor_name]
+        generation = self._part_generations[contactor_name]
+        base_details: dict[str, object] = {
+            "contactor": contactor_name,
+            "part_id": part_id,
+            "observed_closed": observed_closed,
+            "generation": generation,
+            "current_part_id": current_part_id,
+        }
+
+        if part_id is None:
+            return [
+                self._defer_feedback(
+                    base_details, event_timestamp, "missing_part_id"
+                )
+            ]
+
+        if part_id == current_part_id:
+            produced: list[ProtectionEvent] = [
+                self._make_event(
+                    "contactor_feedback_attributed",
+                    reasons=(),
+                    details={**base_details, "attributed_to": "current_part"},
+                )
+            ]
+            mismatch_event = self._update_contactor_feedback(
+                contactor_name, observed_closed, event_timestamp
+            )
+            if mismatch_event is not None:
+                produced.append(mismatch_event)
+            self._dispatch_contactor_commands(event_timestamp)
+            self.events.extend(produced)
+            return produced
+
+        history_entry = next(
+            (
+                entry
+                for entry in reversed(self._part_history)
+                if entry["part_id"] == part_id
+                and entry["contactor"] == contactor_name
+            ),
+            None,
+        )
+        if history_entry is not None:
+            late_feedback = history_entry.setdefault("late_feedback", [])
+            assert isinstance(late_feedback, list)
+            late_feedback.append(
+                {
+                    "timestamp": event_timestamp,
+                    "observed_closed": observed_closed,
+                    "current_part_id": current_part_id,
+                    "current_generation": generation,
+                }
+            )
+            event = self._make_event(
+                "late_contactor_feedback",
+                reasons=(),
+                details={
+                    **base_details,
+                    "attributed_to": "part_history",
+                    "retired_reason": history_entry["retired_reason"],
+                    "live_state_untouched": True,
+                },
+            )
+            self.events.append(event)
+            return [event]
+
+        return [
+            self._defer_feedback(
+                base_details, event_timestamp, "unknown_part_id"
+            )
+        ]
+
+    def _defer_feedback(
+        self,
+        base_details: dict[str, object],
+        timestamp: float,
+        reason: str,
+    ) -> ProtectionEvent:
+        self._pending_feedback.append(
+            {
+                "contactor": base_details["contactor"],
+                "part_id": base_details["part_id"],
+                "observed_closed": base_details["observed_closed"],
+                "timestamp": timestamp,
+                "reason": reason,
+            }
+        )
+        event = self._make_event(
+            "contactor_feedback_pending",
+            reasons=(),
+            details={**base_details, "pending_reason": reason},
+        )
+        self.events.append(event)
+        return event
+
     def register_contactor_replacement(
         self,
         contactor_name: str,
@@ -395,6 +528,7 @@ class ProtectionController:
                 "installed_at": self._part_installed_at[contactor_name],
                 "retired_at": event_timestamp,
                 "retired_reason": "replaced",
+                "generation": self._part_generations[contactor_name],
                 "faults": (
                     [mismatch_name] if (state.active or state.locked) else []
                 ),
@@ -447,6 +581,7 @@ class ProtectionController:
 
         self._current_parts[contactor_name] = new_part_id
         self._part_installed_at[contactor_name] = event_timestamp
+        self._part_generations[contactor_name] += 1
         self._replacement_log.append(
             {
                 "kind": "replaced",
@@ -456,6 +591,7 @@ class ProtectionController:
                 "timestamp": event_timestamp,
                 "note": note,
                 "retracted": False,
+                "generation": self._part_generations[contactor_name],
             }
         )
 
@@ -550,6 +686,7 @@ class ProtectionController:
                     setattr(contactor, field_name, value)
             self._current_parts[contactor_name] = record["old_part_id"]
             self._part_installed_at[contactor_name] = event_timestamp
+            self._part_generations[contactor_name] -= 1
 
         self._replacement_log.append(
             {
@@ -629,8 +766,10 @@ class ProtectionController:
             "parts": {
                 "current": dict(self._current_parts),
                 "installed_at": dict(self._part_installed_at),
+                "generations": dict(self._part_generations),
                 "history": copy.deepcopy(self._part_history),
                 "replacement_log": copy.deepcopy(self._replacement_log),
+                "pending_feedback": copy.deepcopy(self._pending_feedback),
             },
         }
 
@@ -701,12 +840,20 @@ class ProtectionController:
                 for name, value in installed_at.items():
                     if name in self._part_installed_at:
                         self._part_installed_at[name] = value
+            generations = parts_payload.get("generations")
+            if isinstance(generations, dict):
+                for name, value in generations.items():
+                    if name in self._part_generations:
+                        self._part_generations[name] = int(value)
             history = parts_payload.get("history")
             if isinstance(history, list):
                 self._part_history = copy.deepcopy(history)
             replacement_log = parts_payload.get("replacement_log")
             if isinstance(replacement_log, list):
                 self._replacement_log = copy.deepcopy(replacement_log)
+            pending_feedback = parts_payload.get("pending_feedback")
+            if isinstance(pending_feedback, list):
+                self._pending_feedback = copy.deepcopy(pending_feedback)
 
     def _observe(self, measurement: Measurement) -> dict[str, bool]:
         states = {name: False for name in self._states}
