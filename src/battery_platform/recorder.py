@@ -62,6 +62,21 @@ class JsonlEventRecorder:
         self.record_controller_state(controller)
         return event
 
+    def record_part_feedback(
+        self,
+        controller: ProtectionController,
+        contactor_name: str,
+        part_id: str | None,
+        observed_closed: bool | None,
+        timestamp: float | None = None,
+    ) -> list[ProtectionEvent]:
+        events = controller.register_part_feedback(
+            contactor_name, part_id, observed_closed, timestamp
+        )
+        self.record_events(events)
+        self.record_controller_state(controller)
+        return events
+
     def _write(self, payload: dict[str, object]) -> None:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -168,6 +183,33 @@ def replay_recording(
             index += 1
             continue
 
+        if row["record"] == "event" and row["event_type"] in {
+            "part_feedback_applied",
+            "late_part_feedback",
+            "part_feedback_pending",
+        }:
+            timestamp = float(row["timestamp"])
+            details = row["details"]
+            produced = controller.register_part_feedback(
+                details["contactor"],
+                details.get("part_id"),
+                details.get("observed_closed"),
+                timestamp,
+            )
+            expected = [row] + _take_following_events(rows, index)
+            actual = [event.to_dict() for event in produced]
+            expected_payloads = [
+                {key: value for key, value in event.items() if key != "record"}
+                for event in expected
+            ]
+            if actual != expected_payloads:
+                raise ValueError(
+                    f"recorded part feedback decision diverged at t={timestamp}"
+                )
+            trace.append(_trace_point(controller, timestamp))
+            index += len(expected)
+            continue
+
         index += 1
 
     return trace
@@ -188,6 +230,9 @@ def _take_following_events(
             "reset_idle",
             "contactor_replaced",
             "contactor_replacement_retracted",
+            "part_feedback_applied",
+            "late_part_feedback",
+            "part_feedback_pending",
         }
     ):
         events.append(rows[index])
@@ -215,4 +260,6 @@ def _trace_point(
             controller.post_disconnect_verification
         ),
         "current_parts": controller.current_parts,
+        "part_generations": controller.part_generations,
+        "pending_feedback": controller.pending_feedback,
     }

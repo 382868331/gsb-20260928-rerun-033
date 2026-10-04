@@ -62,9 +62,26 @@
   保留为事实，旧部件身份及其归档故障恢复生效，尚未完成的恢复决定在
   `contactor_replacement_retracted` 事件的 `recovery_conditions` 中重新说明依据。
 - 部件身份、历史归档和更换日志都写入快照；中途重开后沿原验证阶段继续，各次上电
-  许可、人工复位及拒绝原因都能追到当时有效的部件和观测。`JsonlEventRecorder`
-  的 `record_replacement()` / `record_retraction()` 与 `replay_recording()` 支持
-  完整回放更换与撤回序列。
+ 许可、人工复位及拒绝原因都能追到当时有效的部件和观测。`JsonlEventRecorder`
+ 的 `record_replacement()` / `record_retraction()` 与 `replay_recording()` 支持
+ 完整回放更换与撤回序列。
+
+## 部件代际与反馈归属
+
+- 每个接触器位置从代际 1 开始；每次更换或撤回更换都推进该位置的代际
+  （`part_generations`），事件细节中的 `charge_part_generation` /
+  `discharge_part_generation` 标明证据产生时的有效代际。
+- `register_part_feedback()` 是携带部件身份的独立反馈入口：只有点名当前在位
+  部件的反馈才进入实时状态（`part_feedback_applied`）；已退役部件的迟到反馈
+  只归档进该部件的 `part_history` 条目（`late_part_feedback` 事件与
+  `late_feedback` 列表），既不污染新部件，也不能借旧件的正常值通过复位验证。
+- 无法确认归属的反馈（缺少 `part_id` 或身份从未安装）保持待定
+  （`part_feedback_pending` 事件与 `pending_feedback` 列表），并记录
+  `missing_part_id` / `unknown_part_id` 原因，不参与任何保护判断。
+- 复位仍要求所有现役部件的条件同时满足：一路更换后，另一路旧件的故障与未完成
+  的断开验证继续阻止复位。代际、待定反馈和迟到归档都写入快照，保存未验证状态
+  重开后反馈归属与计时窗口完整；`record_part_feedback()` 与
+  `replay_recording()` 支持完整回放。
 
 ## 测试配置
 

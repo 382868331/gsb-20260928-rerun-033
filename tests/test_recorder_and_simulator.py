@@ -97,6 +97,8 @@ def test_recording_replays_per_sample_permissions_across_restart(tmp_path):
             "charge": "charge-original",
             "discharge": "discharge-original",
         },
+        "part_generations": {"charge": 1, "discharge": 1},
+        "pending_feedback": [],
         "post_disconnect_verification": {
             "required": True,
             "active": True,

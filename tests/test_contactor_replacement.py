@@ -330,3 +330,136 @@ def test_retraction_replays_from_recording(tmp_path):
     assert "charge_contactor_mismatch" in rebooted.active_reasons
     trace = replay_recording(path, config=config())
     assert trace[-1]["current_parts"]["charge"] == "charge-original"
+
+
+def test_part_feedback_attribution_isolated_by_generation(tmp_path):
+    path = tmp_path / "attribution.jsonl"
+    recorder = JsonlEventRecorder(path)
+    c = controller()
+    for measurement in (
+        sample(0.0, charge_feedback=True, discharge_feedback=True,
+               load_voltage=48.0, value=3.7),
+        sample(1.0, charge_feedback=True, discharge_feedback=True,
+               load_voltage=48.0),
+        sample(1.5, charge_feedback=True, discharge_feedback=True,
+               load_voltage=48.0),
+        sample(2.0, charge_feedback=True, discharge_feedback=True,
+               load_voltage=48.0),
+        sample(2.5, charge_feedback=True, discharge_feedback=True,
+               load_voltage=48.0),
+    ):
+        recorder.record_measurement(measurement)
+        recorder.record_events(c.update(measurement))
+    assert "charge_contactor_mismatch" in c.active_reasons
+    assert "discharge_contactor_mismatch" in c.active_reasons
+
+    # Only the charge pole is replaced; a new generation starts.
+    recorder.record_replacement(c, "charge", "charge-A2", 3.0,
+                                note="welded pole swapped")
+    assert c.part_generations == {"charge": 2, "discharge": 1}
+
+    # Late close feedback from the retired part only enters its history.
+    late = recorder.record_part_feedback(
+        c, "charge", "charge-original", True, 3.1
+    )
+    assert late[0].event_type == "late_part_feedback"
+    assert late[0].details["generation"] == 1
+    assert late[0].details["current_generation"] == 2
+    history = c.part_history
+    assert history[0]["part_id"] == "charge-original"
+    assert history[0]["late_feedback"][-1]["observed_closed"] is True
+    # The live observation of the new part is untouched.
+    assert c.charge_contactor_observed_closed is True
+
+    # A normal value from the old part must not help the new part pass.
+    late = recorder.record_part_feedback(
+        c, "charge", "charge-original", False, 3.2
+    )
+    assert late[0].event_type == "late_part_feedback"
+    assert c.charge_contactor_observed_closed is True
+    assert not events(c, "post_disconnect_verification_passed")
+
+    # Feedback naming the installed part applies to the live state.
+    applied = recorder.record_part_feedback(c, "charge", "charge-A2", False, 3.3)
+    assert applied[0].event_type == "part_feedback_applied"
+    assert applied[0].details["generation"] == 2
+    assert c.charge_contactor_observed_closed is False
+
+    # The other old part is still faulted: reset requires every current
+    # part's conditions, so the new part's normal feedback is not enough.
+    measurement = sample(3.4, charge_feedback=False, discharge_feedback=True,
+                         load_voltage=4.0, value=4.05)
+    recorder.record_measurement(measurement)
+    recorder.record_events(c.update(measurement))
+    blocked = recorder.record_reset(c, 3.4)
+    assert "discharge_contactor_mismatch" in blocked[0].details[
+        "blocked_reasons"
+    ]
+    assert "post_disconnect_voltage_verification" in blocked[0].details[
+        "blocked_reasons"
+    ]
+    assert blocked[0].details["charge_part_id"] == "charge-A2"
+    assert blocked[0].details["charge_part_generation"] == 2
+
+    # Feedback that cannot be attributed stays pending with a reason.
+    pending = recorder.record_part_feedback(c, "charge", None, False, 3.5)
+    assert pending[0].event_type == "part_feedback_pending"
+    assert pending[0].details["reason"] == "missing_part_id"
+    pending = recorder.record_part_feedback(
+        c, "discharge", "discharge-ghost", True, 3.5
+    )
+    assert pending[0].details["reason"] == "unknown_part_id"
+    assert [entry["reason"] for entry in c.pending_feedback] == [
+        "missing_part_id",
+        "unknown_part_id",
+    ]
+
+    # Retracting the swap reinstates the old part with its archived fault
+    # and starts yet another generation.
+    retracted = recorder.record_retraction(
+        c, "charge", 3.6, reason="wrong contactor logged"
+    )
+    assert retracted.details["reinstated_part_id"] == "charge-original"
+    assert retracted.details["reinstated_generation"] == 3
+    assert "charge_contactor_mismatch" in c.active_reasons
+    assert c.part_generations == {"charge": 3, "discharge": 1}
+
+    # Save the still-unverified state and reopen: attribution, generations,
+    # pending feedback and timing windows all survive the restart.
+    recorder.record_controller_state(c)
+    rebooted = restore_controller(path, config=config())
+    assert rebooted.current_parts["charge"] == "charge-original"
+    assert rebooted.part_generations == {"charge": 3, "discharge": 1}
+    assert [entry["reason"] for entry in rebooted.pending_feedback] == [
+        "missing_part_id",
+        "unknown_part_id",
+    ]
+    history = rebooted.part_history
+    original_entries = [
+        entry for entry in history if entry["part_id"] == "charge-original"
+    ]
+    assert original_entries[0]["late_feedback"]
+    assert original_entries[0]["fault_state"]["locked"] is True
+    assert "charge_contactor_mismatch" in rebooted.active_reasons
+    assert "discharge_contactor_mismatch" in rebooted.active_reasons
+    assert rebooted.post_disconnect_verification["active"] is True
+
+    # After the restart the old part's late feedback still cannot leak into
+    # the live state, and reset remains blocked by both welded poles.
+    late = rebooted.register_part_feedback(
+        "charge", "charge-A2", False, 3.7
+    )
+    assert late[0].event_type == "late_part_feedback"
+    rebooted.update(sample(3.8, charge_feedback=True, discharge_feedback=True,
+                           load_voltage=48.0, value=4.05))
+    blocked = rebooted.request_reset(3.8)
+    assert "charge_contactor_mismatch" in blocked[0].details[
+        "blocked_reasons"
+    ]
+    assert "discharge_contactor_mismatch" in blocked[0].details[
+        "blocked_reasons"
+    ]
+
+    trace = replay_recording(path, config=config())
+    assert trace[-1]["current_parts"]["charge"] == "charge-original"
+    assert trace[-1]["part_generations"] == {"charge": 3, "discharge": 1}
