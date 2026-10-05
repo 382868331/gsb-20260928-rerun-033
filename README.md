@@ -80,8 +80,28 @@
   `missing_part_id` / `unknown_part_id` 原因，不参与任何保护判断。
 - 复位仍要求所有现役部件的条件同时满足：一路更换后，另一路旧件的故障与未完成
   的断开验证继续阻止复位。代际、待定反馈和迟到归档都写入快照，保存未验证状态
-  重开后反馈归属与计时窗口完整；`record_part_feedback()` 与
+ 重开后反馈归属与计时窗口完整；`record_part_feedback()` 与
   `replay_recording()` 支持完整回放。
+
+## 待定反馈的人工补认
+
+- `pending_feedback_review()` 面向维修人员展示每条待定反馈的原始报告、身份缺失
+  原因（`missing_part_id` / `unknown_part_id`）和该位置的完整安装记录
+  （`installation_records()`：部件、代际、安装/退役时间）；同一部件多次安装、
+  报告早于最近一次更换（迟到）以及更换记录被撤回时，`ambiguity` 明确列出
+  `multiple_installations`、`part_installed_multiple_times`、
+  `installation_changed_after_report`、`replacement_retracted_after_report`，
+  提示哪些反馈仍有歧义。
+- `attribute_pending_feedback()` 用确切部件和安装代次形成独立的补认决定，操作者、
+  时间和理由写入 `attribution_log`；原反馈不加改写地归档进 `resolved_feedback`。
+  只有补认到当前在位部件的当前代际才进入实时状态；补认到已退役代际只归档进该
+  部件的历史，不能借历史报告通过本次恢复验证。重复提交同一有效决定只产生
+  `part_feedback_attribution_duplicate` 事件，不会重复计入验证。
+- `revoke_attribution()` 撤销误认：原决定保留为事实，撤销作为新决定追加（同样记录
+  操作者、时间、理由），反馈原样回到待处理列表，其造成的实时观测回滚到补认前的
+  值，之后可重新指定。待处理列表、补认历史、已归档反馈和序号都写入快照，保存
+  重开后与当前故障判断保持一致；`record_attribution()` /
+  `record_attribution_revoke()` 与 `replay_recording()` 支持完整回放。
 
 ## 测试配置
 

@@ -77,6 +77,38 @@ class JsonlEventRecorder:
         self.record_controller_state(controller)
         return events
 
+    def record_attribution(
+        self,
+        controller: ProtectionController,
+        feedback_id: str,
+        part_id: str,
+        generation: int,
+        operator: str,
+        reason: str,
+        timestamp: float | None = None,
+    ) -> list[ProtectionEvent]:
+        events = controller.attribute_pending_feedback(
+            feedback_id, part_id, generation, operator, reason, timestamp
+        )
+        self.record_events(events)
+        self.record_controller_state(controller)
+        return events
+
+    def record_attribution_revoke(
+        self,
+        controller: ProtectionController,
+        feedback_id: str,
+        operator: str,
+        reason: str,
+        timestamp: float | None = None,
+    ) -> list[ProtectionEvent]:
+        events = controller.revoke_attribution(
+            feedback_id, operator, reason, timestamp
+        )
+        self.record_events(events)
+        self.record_controller_state(controller)
+        return events
+
     def _write(self, payload: dict[str, object]) -> None:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -210,6 +242,56 @@ def replay_recording(
             index += len(expected)
             continue
 
+        if row["record"] == "event" and row["event_type"] in {
+            "part_feedback_attributed",
+            "part_feedback_attribution_duplicate",
+        }:
+            timestamp = float(row["timestamp"])
+            details = row["details"]
+            produced = controller.attribute_pending_feedback(
+                details["feedback_id"],
+                details["part_id"],
+                details["generation"],
+                details["operator"],
+                details.get("reason", ""),
+                timestamp,
+            )
+            expected = [row] + _take_following_events(rows, index)
+            actual = [event.to_dict() for event in produced]
+            expected_payloads = [
+                {key: value for key, value in event.items() if key != "record"}
+                for event in expected
+            ]
+            if actual != expected_payloads:
+                raise ValueError(
+                    f"recorded attribution decision diverged at t={timestamp}"
+                )
+            trace.append(_trace_point(controller, timestamp))
+            index += len(expected)
+            continue
+
+        if row["record"] == "event" and row["event_type"] in {
+            "part_feedback_attribution_revoked",
+        }:
+            timestamp = float(row["timestamp"])
+            details = row["details"]
+            produced = controller.revoke_attribution(
+                details["feedback_id"],
+                details["operator"],
+                details.get("reason", ""),
+                timestamp,
+            )
+            actual = [event.to_dict() for event in produced]
+            if actual != [
+                {key: value for key, value in row.items() if key != "record"}
+            ]:
+                raise ValueError(
+                    f"recorded attribution revoke diverged at t={timestamp}"
+                )
+            trace.append(_trace_point(controller, timestamp))
+            index += 1
+            continue
+
         index += 1
 
     return trace
@@ -233,6 +315,9 @@ def _take_following_events(
             "part_feedback_applied",
             "late_part_feedback",
             "part_feedback_pending",
+            "part_feedback_attributed",
+            "part_feedback_attribution_duplicate",
+            "part_feedback_attribution_revoked",
         }
     ):
         events.append(rows[index])
