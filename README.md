@@ -83,6 +83,24 @@
   重开后反馈归属与计时窗口完整；`record_part_feedback()` 与
   `replay_recording()` 支持完整回放。
 
+## 待定反馈的人工补认
+
+- `pending_feedback_view()` 面向维修人员展示每条未决反馈：原始反馈内容、缺失身份
+  的原因（`missing_part_id` / `unknown_part_id`）、反馈时刻的在装部件与全部安装
+  记录，以及歧义标记（`multiple_installations`、`repeated_part_installations`、
+  `late_feedback_recorded`、`replacement_retracted`），同一部件多次安装、报告
+  迟到或更换记录被撤回时能明确看出哪些反馈仍有歧义。
+- `attribute_pending_feedback()` 按确切部件与安装代次形成独立的补认决定，记录
+  操作者、时间和理由。补认不改写原始反馈，只把报告归档到所选部件代次的历史中，
+  不进入实时状态——历史报告不能仅凭部件编号与当前一致就用于本次恢复验证。
+  重复提交同一决定是幂等的，不会重复记录、也不会重复计入验证。
+- `revoke_attribution()` 撤销误认：原决定保留在 `attribution_history` 中并标注
+  撤销人、时间和理由，反馈回到待处理列表，可重新指定；每次决定的操作者、时间
+  和理由都完整保留。
+- 补认决定、反馈序号和待处理列表都写入快照；保存重开后待处理列表、补认历史与
+  当前故障判断保持一致。`record_attribution()` /
+  `record_attribution_revocation()` 与 `replay_recording()` 支持完整回放。
+
 ## 测试配置
 
 可直接在测试中构造配置，也可从字典加载：

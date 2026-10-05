@@ -146,6 +146,9 @@ class ProtectionController:
             name: 1 for name in self._CONTACTOR_NAMES
         }
         self._pending_feedback: list[dict[str, object]] = []
+        self._feedback_sequence = 0
+        self._attribution_log: list[dict[str, object]] = []
+        self._decision_sequence = 0
         self.events: list[ProtectionEvent] = []
         self.current_timestamp: float | None = None
         self.current_load_voltage: float | None = None
@@ -367,7 +370,122 @@ class ProtectionController:
 
     @property
     def pending_feedback(self) -> list[dict[str, object]]:
-        return copy.deepcopy(self._pending_feedback)
+        entries = copy.deepcopy(self._pending_feedback)
+        for entry in entries:
+            decision = self._active_decision_for(entry["feedback_id"])
+            entry["status"] = "attributed" if decision else "pending"
+            entry["decision_id"] = decision["decision_id"] if decision else None
+        return entries
+
+    @property
+    def attribution_history(self) -> list[dict[str, object]]:
+        return copy.deepcopy(self._attribution_log)
+
+    def pending_feedback_view(self) -> list[dict[str, object]]:
+        """Unresolved feedback with the context a maintainer needs to decide.
+
+        Each row keeps the original feedback untouched and adds the reason
+        the identity is missing, the installation records in effect at the
+        feedback timestamp, and explicit ambiguity flags (repeated
+        installations of the same part, late reports already on record and
+        retracted replacements).
+        """
+
+        view = []
+        for entry in self.pending_feedback:
+            if entry["status"] != "pending":
+                continue
+            contactor_name = entry["contactor"]
+            installations = self._installation_records(contactor_name)
+            current_at_feedback = next(
+                (
+                    record
+                    for record in installations
+                    if self._covers(record, entry["timestamp"])
+                ),
+                None,
+            )
+            part_ids = [record["part_id"] for record in installations]
+            ambiguity = []
+            if len(installations) > 1:
+                ambiguity.append("multiple_installations")
+            if len(part_ids) != len(set(part_ids)):
+                ambiguity.append("repeated_part_installations")
+            if any(
+                history.get("late_feedback")
+                for history in self._part_history
+                if history["contactor"] == contactor_name
+            ):
+                ambiguity.append("late_feedback_recorded")
+            if any(
+                record["kind"] == "retracted"
+                for record in self._replacement_log
+                if record["contactor"] == contactor_name
+            ):
+                ambiguity.append("replacement_retracted")
+            view.append(
+                {
+                    **entry,
+                    "installation_at_feedback": current_at_feedback,
+                    "installation_records": installations,
+                    "ambiguity": ambiguity,
+                }
+            )
+        return view
+
+    def _installation_records(
+        self, contactor_name: str
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = [
+            {
+                "part_id": entry["part_id"],
+                "generation": entry["generation"],
+                "installed_at": entry["installed_at"],
+                "retired_at": entry["retired_at"],
+                "retired_reason": entry["retired_reason"],
+            }
+            for entry in self._part_history
+            if entry["contactor"] == contactor_name
+        ]
+        records.append(
+            {
+                "part_id": self._current_parts[contactor_name],
+                "generation": self._part_generations[contactor_name],
+                "installed_at": self._part_installed_at[contactor_name],
+                "retired_at": None,
+                "retired_reason": "installed",
+            }
+        )
+        records.sort(
+            key=lambda record: (
+                record["installed_at"] is None,
+                record["installed_at"] or 0.0,
+            )
+        )
+        return records
+
+    @staticmethod
+    def _covers(record: dict[str, object], timestamp: object) -> bool:
+        installed_at = record["installed_at"]
+        retired_at = record["retired_at"]
+        if installed_at is not None and timestamp < installed_at:
+            return False
+        if retired_at is not None and timestamp >= retired_at:
+            return False
+        return True
+
+    def _active_decision_for(
+        self, feedback_id: object
+    ) -> dict[str, object] | None:
+        return next(
+            (
+                decision
+                for decision in reversed(self._attribution_log)
+                if decision["feedback_id"] == feedback_id
+                and decision["status"] == "active"
+            ),
+            None,
+        )
 
     def register_part_feedback(
         self,
@@ -471,8 +589,10 @@ class ProtectionController:
         timestamp: float,
         reason: str,
     ) -> list[ProtectionEvent]:
+        self._feedback_sequence += 1
         self._pending_feedback.append(
             {
+                "feedback_id": self._feedback_sequence,
                 "contactor": base_details["contactor"],
                 "part_id": base_details["part_id"],
                 "observed_closed": base_details["observed_closed"],
@@ -483,10 +603,209 @@ class ProtectionController:
         event = self._make_event(
             "part_feedback_pending",
             reasons=(),
-            details={**base_details, "reason": reason},
+            details={
+                **base_details,
+                "reason": reason,
+                "feedback_id": self._feedback_sequence,
+            },
         )
         self.events.append(event)
         return [event]
+
+    def attribute_pending_feedback(
+        self,
+        feedback_id: int,
+        part_id: str,
+        generation: int,
+        operator: str,
+        reason: str,
+        timestamp: float | None = None,
+    ) -> list[ProtectionEvent]:
+        """Manually attribute a pending feedback to an exact installation.
+
+        The decision is an independent record: the original pending feedback
+        is never rewritten, and the attributed report is only archived
+        against the chosen part and generation. It is not applied to the
+        live contactor state, so a historical report can never pass the
+        current recovery verification just because its part id matches the
+        currently installed part. Submitting the identical decision twice
+        is idempotent and does not create a second record.
+        """
+
+        event_timestamp = (
+            self.current_timestamp if timestamp is None else timestamp
+        )
+        if event_timestamp is None:
+            raise ValueError("timestamp is required before the first update")
+        self.current_timestamp = event_timestamp
+        if not operator:
+            raise ValueError("operator is required")
+
+        entry = next(
+            (
+                item
+                for item in self._pending_feedback
+                if item["feedback_id"] == feedback_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise ValueError("unknown pending feedback: " + str(feedback_id))
+
+        existing = self._active_decision_for(feedback_id)
+        if existing is not None:
+            if (
+                existing["part_id"] == part_id
+                and existing["generation"] == generation
+                and existing["operator"] == operator
+            ):
+                return []
+            raise ValueError(
+                "feedback already attributed; revoke decision "
+                + str(existing["decision_id"])
+                + " before re-attributing"
+            )
+
+        contactor_name = entry["contactor"]
+        installation = next(
+            (
+                record
+                for record in self._installation_records(contactor_name)
+                if record["part_id"] == part_id
+                and record["generation"] == generation
+            ),
+            None,
+        )
+        if installation is None:
+            raise ValueError(
+                "no installation of "
+                + part_id
+                + " at generation "
+                + str(generation)
+                + " on "
+                + contactor_name
+            )
+
+        self._decision_sequence += 1
+        decision = {
+            "decision_id": self._decision_sequence,
+            "feedback_id": feedback_id,
+            "contactor": contactor_name,
+            "part_id": part_id,
+            "generation": generation,
+            "operator": operator,
+            "reason": reason,
+            "timestamp": event_timestamp,
+            "status": "active",
+            "revoked_at": None,
+            "revoked_by": None,
+            "revocation_reason": None,
+            "feedback": copy.deepcopy(entry),
+        }
+        self._attribution_log.append(decision)
+
+        history_entry = next(
+            (
+                item
+                for item in reversed(self._part_history)
+                if item["part_id"] == part_id
+                and item["contactor"] == contactor_name
+                and item["generation"] == generation
+            ),
+            None,
+        )
+        if history_entry is not None:
+            attributed = history_entry.setdefault("attributed_feedback", [])
+            assert isinstance(attributed, list)
+            attributed.append(
+                {
+                    "timestamp": entry["timestamp"],
+                    "observed_closed": entry["observed_closed"],
+                    "attributed_at": event_timestamp,
+                    "operator": operator,
+                    "decision_id": decision["decision_id"],
+                }
+            )
+
+        event = self._make_event(
+            "part_feedback_attributed",
+            reasons=(),
+            details={
+                "decision_id": decision["decision_id"],
+                "feedback_id": feedback_id,
+                "contactor": contactor_name,
+                "part_id": part_id,
+                "generation": generation,
+                "operator": operator,
+                "reason": reason,
+                "original_feedback": copy.deepcopy(entry),
+                "applied_to_live_state": False,
+                "current_part_id": self._current_parts[contactor_name],
+                "current_generation": self._part_generations[contactor_name],
+            },
+        )
+        self.events.append(event)
+        return [event]
+
+    def revoke_attribution(
+        self,
+        decision_id: int,
+        operator: str,
+        reason: str,
+        timestamp: float | None = None,
+    ) -> ProtectionEvent:
+        """Revoke a mistaken attribution decision.
+
+        The decision stays in the attribution log with its operator, time
+        and reason; the feedback returns to the pending list and can be
+        re-attributed by a new decision.
+        """
+
+        event_timestamp = (
+            self.current_timestamp if timestamp is None else timestamp
+        )
+        if event_timestamp is None:
+            raise ValueError("timestamp is required before the first update")
+        self.current_timestamp = event_timestamp
+        if not operator:
+            raise ValueError("operator is required")
+
+        decision = next(
+            (
+                item
+                for item in self._attribution_log
+                if item["decision_id"] == decision_id
+            ),
+            None,
+        )
+        if decision is None:
+            raise ValueError("unknown attribution decision: " + str(decision_id))
+        if decision["status"] != "active":
+            raise ValueError(
+                "attribution decision already revoked: " + str(decision_id)
+            )
+
+        decision["status"] = "revoked"
+        decision["revoked_at"] = event_timestamp
+        decision["revoked_by"] = operator
+        decision["revocation_reason"] = reason
+
+        event = self._make_event(
+            "part_feedback_attribution_revoked",
+            reasons=(),
+            details={
+                "decision_id": decision_id,
+                "feedback_id": decision["feedback_id"],
+                "contactor": decision["contactor"],
+                "part_id": decision["part_id"],
+                "generation": decision["generation"],
+                "operator": operator,
+                "reason": reason,
+                "original_feedback": copy.deepcopy(decision["feedback"]),
+            },
+        )
+        self.events.append(event)
+        return event
 
     def register_contactor_replacement(
         self,
@@ -774,6 +1093,9 @@ class ProtectionController:
                 "history": copy.deepcopy(self._part_history),
                 "replacement_log": copy.deepcopy(self._replacement_log),
                 "pending_feedback": copy.deepcopy(self._pending_feedback),
+                "feedback_sequence": self._feedback_sequence,
+                "attribution_log": copy.deepcopy(self._attribution_log),
+                "decision_sequence": self._decision_sequence,
             },
         }
 
@@ -858,6 +1180,19 @@ class ProtectionController:
             pending_feedback = parts_payload.get("pending_feedback")
             if isinstance(pending_feedback, list):
                 self._pending_feedback = copy.deepcopy(pending_feedback)
+            feedback_sequence = parts_payload.get("feedback_sequence")
+            if isinstance(feedback_sequence, int):
+                self._feedback_sequence = feedback_sequence
+            for item in self._pending_feedback:
+                if "feedback_id" not in item:
+                    self._feedback_sequence += 1
+                    item["feedback_id"] = self._feedback_sequence
+            attribution_log = parts_payload.get("attribution_log")
+            if isinstance(attribution_log, list):
+                self._attribution_log = copy.deepcopy(attribution_log)
+            decision_sequence = parts_payload.get("decision_sequence")
+            if isinstance(decision_sequence, int):
+                self._decision_sequence = decision_sequence
 
     def _observe(self, measurement: Measurement) -> dict[str, bool]:
         states = {name: False for name in self._states}
