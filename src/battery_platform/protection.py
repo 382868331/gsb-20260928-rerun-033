@@ -77,6 +77,7 @@ class _ContactorState:
     requested_since: float | None = None
     observed_closed: bool | None = None
     observed_since: float | None = None
+    observed_basis: dict[str, object] | None = None
     mismatch: bool = False
     mismatch_since: float | None = None
     recovery_candidate_since: float | None = None
@@ -171,6 +172,11 @@ class ProtectionController:
     def discharge_contactor_observed_closed(self) -> bool | None:
         return self._contactors["discharge"].observed_closed
 
+    def observed_basis(self, contactor_name: str) -> dict[str, object] | None:
+        if contactor_name not in self._contactors:
+            raise ValueError("unknown contactor: " + contactor_name)
+        return copy.deepcopy(self._contactors[contactor_name].observed_basis)
+
     @property
     def post_disconnect_verification(self) -> dict[str, object]:
         verification = self._disconnect_verification
@@ -264,7 +270,16 @@ class ProtectionController:
             ("discharge", measurement.discharge_contactor_feedback),
         ):
             event = self._update_contactor_feedback(
-                contactor_name, observed, measurement.timestamp
+                contactor_name,
+                observed,
+                measurement.timestamp,
+                basis={
+                    "kind": "measurement",
+                    "contactor": contactor_name,
+                    "part_id": self._current_parts[contactor_name],
+                    "generation": self._part_generations[contactor_name],
+                    "timestamp": measurement.timestamp,
+                },
             )
             if event is not None:
                 produced.append(event)
@@ -518,7 +533,16 @@ class ProtectionController:
                 )
             ]
             feedback_event = self._update_contactor_feedback(
-                contactor_name, observed_closed, event_timestamp
+                contactor_name,
+                observed_closed,
+                event_timestamp,
+                basis={
+                    "kind": "part_feedback",
+                    "contactor": contactor_name,
+                    "part_id": current_part_id,
+                    "generation": current_generation,
+                    "timestamp": event_timestamp,
+                },
             )
             if feedback_event is not None:
                 produced.append(feedback_event)
@@ -723,6 +747,9 @@ class ProtectionController:
             contactor = self._contactors[contactor_name]
             decision["prior_observed_closed"] = contactor.observed_closed
             decision["prior_observed_since"] = contactor.observed_since
+            decision["prior_observed_basis"] = copy.deepcopy(
+                contactor.observed_basis
+            )
         else:
             history_entry = next(
                 (
@@ -779,6 +806,16 @@ class ProtectionController:
                 contactor_name,
                 observed_closed if isinstance(observed_closed, bool) else None,
                 event_timestamp,
+                basis={
+                    "kind": "attribution",
+                    "contactor": contactor_name,
+                    "part_id": part_id,
+                    "generation": generation,
+                    "feedback_id": feedback_id,
+                    "decision_id": decision_id,
+                    "original_timestamp": pending_entry["timestamp"],
+                    "timestamp": event_timestamp,
+                },
             )
             if feedback_event is not None:
                 produced.append(feedback_event)
@@ -848,20 +885,48 @@ class ProtectionController:
                 copy.deepcopy(resolved_entry["feedback"])
             )
 
+        rolled_back_live = False
+        retained_basis = None
         if decision["applied_to_live"]:
             resolved = resolved_entry or {}
             feedback = resolved.get("feedback", {})
-            contactor_name = str(
+            feedback_contactor = str(
                 feedback.get("contactor", "")
             ) if isinstance(feedback, dict) else ""
-            if contactor_name in self._contactors:
-                contactor = self._contactors[contactor_name]
-                contactor.observed_closed = decision.get(
-                    "prior_observed_closed"
+            contactor = self._contactors.get(feedback_contactor)
+            if contactor is not None:
+                basis = contactor.observed_basis
+                still_depends_on_decision = (
+                    isinstance(basis, dict)
+                    and basis.get("kind") == "attribution"
+                    and basis.get("decision_id")
+                    == decision["decision_id"]
+                    and basis.get("generation") == decision["generation"]
+                    and basis.get("part_id") == decision["part_id"]
                 )
-                contactor.observed_since = decision.get(
-                    "prior_observed_since"
-                )
+                if still_depends_on_decision:
+                    contactor.observed_closed = decision.get(
+                        "prior_observed_closed"
+                    )
+                    contactor.observed_since = decision.get(
+                        "prior_observed_since"
+                    )
+                    contactor.observed_basis = copy.deepcopy(
+                        decision.get("prior_observed_basis")
+                    )
+                    rolled_back_live = True
+                else:
+                    retained_basis = copy.deepcopy(basis)
+        else:
+            for history_entry in self._part_history:
+                late_feedback = history_entry.get("late_feedback")
+                if not isinstance(late_feedback, list):
+                    continue
+                history_entry["late_feedback"] = [
+                    entry
+                    for entry in late_feedback
+                    if entry.get("decision_id") != decision["decision_id"]
+                ]
 
         event = self._make_event(
             "part_feedback_attribution_revoked",
@@ -874,6 +939,8 @@ class ProtectionController:
                 "generation": decision["generation"],
                 "operator": operator,
                 "reason": reason,
+                "rolled_back_live_observation": rolled_back_live,
+                "retained_basis": retained_basis,
             },
         )
         self.events.append(event)
@@ -1137,6 +1204,9 @@ class ProtectionController:
                     "requested_since": contactor.requested_since,
                     "observed_closed": contactor.observed_closed,
                     "observed_since": contactor.observed_since,
+                    "observed_basis": copy.deepcopy(
+                        contactor.observed_basis
+                    ),
                     "mismatch": contactor.mismatch,
                     "mismatch_since": contactor.mismatch_since,
                     "recovery_candidate_since": contactor.recovery_candidate_since,
@@ -1202,6 +1272,7 @@ class ProtectionController:
                     "requested_since",
                     "observed_closed",
                     "observed_since",
+                    "observed_basis",
                     "mismatch",
                     "mismatch_since",
                     "recovery_candidate_since",
@@ -1479,10 +1550,12 @@ class ProtectionController:
         contactor_name: str,
         observed_closed: bool | None,
         timestamp: float,
+        basis: dict[str, object] | None = None,
     ) -> ProtectionEvent | None:
         contactor = self._contactors[contactor_name]
         previous_observed = contactor.observed_closed
         contactor.observed_closed = observed_closed
+        contactor.observed_basis = copy.deepcopy(basis)
         if observed_closed != previous_observed:
             contactor.observed_since = timestamp
             if observed_closed is False:

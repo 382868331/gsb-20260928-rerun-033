@@ -315,3 +315,132 @@ def test_recorder_replay_roundtrip(tmp_path):
         entry["action"] for entry in restored.attribution_log
     ] == ["attributed", "revoked", "attributed"]
     assert restored.charge_contactor_observed_closed is False
+
+
+def test_revoke_keeps_later_explicit_feedback():
+    """A revocation only removes an explanation that still owns the state.
+
+    Explicit feedback received after the attribution becomes the current
+    protection basis; revoking the older manual decision must return the
+    report to pending without rolling the contactor back.
+    """
+    c = controller()
+    trip_overvoltage(c)
+    c.register_part_feedback("charge", None, False, 1.5)
+    c.attribute_pending_feedback(
+        "pf-1", "charge-original", 1, "tech-07", "initial guess", 2.0
+    )
+    assert c.charge_contactor_observed_closed is False
+    basis = c.observed_basis("charge")
+    assert basis["kind"] == "attribution"
+    assert basis["decision_id"] == "pa-1"
+
+    # Real physical feedback arrives later for the installed part.
+    c.register_part_feedback("charge", "charge-original", False, 2.5)
+    assert c.observed_basis("charge")["kind"] == "part_feedback"
+
+    produced = c.revoke_attribution(
+        "pf-1", "tech-08", "wrong work order", 3.0
+    )
+    details = produced[0].details
+    assert details["rolled_back_live_observation"] is False
+    assert details["retained_basis"]["kind"] == "part_feedback"
+    assert details["retained_basis"]["timestamp"] == 2.5
+    # The later explicit feedback still owns the live observation.
+    assert c.charge_contactor_observed_closed is False
+    assert c.observed_basis("charge")["kind"] == "part_feedback"
+    assert len(c.pending_feedback) == 1
+    assert c.pending_feedback[0]["feedback_id"] == "pf-1"
+
+    # Re-attribution must not overwrite the newer observation either.
+    produced = c.attribute_pending_feedback(
+        "pf-1", "charge-original", 1, "tech-08",
+        "confirmed against install sheet", 4.0,
+    )
+    assert c.charge_contactor_observed_closed is False
+    # The re-attribution targets the same live part, so it becomes the
+    # explanation of the current observation again.
+    assert c.observed_basis("charge")["kind"] == "attribution"
+    assert c.observed_basis("charge")["decision_id"] == "pa-3"
+
+
+def test_revoke_after_replacement_does_not_touch_new_part():
+    """Same numbered position, new generation: an old decision cannot roll
+    the new part's observation back."""
+    c = controller()
+    trip_overvoltage(c)
+    c.register_part_feedback("charge", None, False, 1.5)
+    c.attribute_pending_feedback(
+        "pf-1", "charge-original", 1, "tech-07", "initial guess", 2.0
+    )
+    assert c.observed_basis("charge")["generation"] == 1
+
+    # Same position gets a new generation, then real feedback for it.
+    c.register_contactor_replacement("charge", "charge-A2", 3.0)
+    c.register_part_feedback("charge", "charge-A2", False, 3.5)
+    assert c.observed_basis("charge")["generation"] == 2
+
+    produced = c.revoke_attribution(
+        "pf-1", "tech-08", "wrong work order", 4.0
+    )
+    details = produced[0].details
+    assert details["rolled_back_live_observation"] is False
+    assert details["retained_basis"]["generation"] == 2
+    assert details["retained_basis"]["part_id"] == "charge-A2"
+    assert c.charge_contactor_observed_closed is False
+    assert c.observed_basis("charge")["part_id"] == "charge-A2"
+    assert len(c.pending_feedback) == 1
+    # Old part history keeps its archived facts; the revoked report is not
+    # claimed by either part.
+    old_history = next(
+        entry for entry in c.part_history
+        if entry["part_id"] == "charge-original"
+    )
+    assert old_history.get("late_feedback", []) == []
+
+
+def test_revoke_after_reattribution_and_replacement_roundtrip(tmp_path):
+    """Full sequence: attribute old feedback, receive new feedback, revoke,
+    re-attribute, replace the same numbered part, save and reopen."""
+    c = controller()
+    trip_overvoltage(c)
+    c.register_part_feedback("charge", None, False, 1.5)
+    c.attribute_pending_feedback(
+        "pf-1", "charge-original", 1, "tech-07", "initial guess", 2.0
+    )
+    c.register_part_feedback("charge", "charge-original", False, 2.5)
+    c.revoke_attribution("pf-1", "tech-08", "wrong work order", 3.0)
+    c.attribute_pending_feedback(
+        "pf-1", "charge-original", 1, "tech-08",
+        "confirmed against install sheet", 4.0,
+    )
+    c.register_contactor_replacement("charge", "charge-A2", 5.0)
+    c.register_part_feedback("charge", "charge-A2", False, 5.5)
+
+    snapshot = c.state_snapshot()
+    restored = controller()
+    restored.restore_state(snapshot)
+    assert restored.charge_contactor_observed_closed is False
+    basis = restored.observed_basis("charge")
+    assert basis["kind"] == "part_feedback"
+    assert basis["part_id"] == "charge-A2"
+    assert basis["generation"] == 2
+    assert restored.part_generations["charge"] == 2
+    assert restored.pending_feedback == []
+    assert [
+        entry["action"] for entry in restored.attribution_log
+    ] == ["attributed", "revoked", "attributed"]
+    # The original feedback report is preserved unchanged.
+    resolved = restored.resolved_feedback
+    assert len(resolved) == 1
+    original = resolved[0]["feedback"]
+    assert original["feedback_id"] == "pf-1"
+    assert original["part_id"] is None
+    assert original["observed_closed"] is False
+    assert original["timestamp"] == 1.5
+    assert original["reason"] == "missing_part_id"
+    old_history = next(
+        entry for entry in restored.part_history
+        if entry["part_id"] == "charge-original"
+    )
+    assert old_history.get("late_feedback", []) == []
