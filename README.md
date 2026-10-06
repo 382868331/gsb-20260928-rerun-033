@@ -98,10 +98,16 @@
   部件的历史，不能借历史报告通过本次恢复验证。重复提交同一有效决定只产生
   `part_feedback_attribution_duplicate` 事件，不会重复计入验证。
 - `revoke_attribution()` 撤销误认：原决定保留为事实，撤销作为新决定追加（同样记录
-  操作者、时间、理由），反馈原样回到待处理列表，其造成的实时观测回滚到补认前的
-  值，之后可重新指定。待处理列表、补认历史、已归档反馈和序号都写入快照，保存
-  重开后与当前故障判断保持一致；`record_attribution()` /
-  `record_attribution_revoke()` 与 `replay_recording()` 支持完整回放。
+  操作者、时间、理由），反馈原样回到待处理列表，之后可重新指定。撤回按时间、
+  部件和安装代次追踪每条实时观测的依据（`contactor_observed_basis()`：
+  `measurement` 原始测量、`part_feedback` 具名部件反馈、`attribution` 补认决定）：
+  只有当前观测仍由该决定解释时，才恢复补认前的值与依据；归属之后到达的真实测量
+  或具名部件反馈、以及同编号部件换代后的新代次证据都已独立成立，撤回只移除该
+  决定本身，绝不回滚后来的明确反馈。撤回事件以 `live_observation_rolled_back`
+  和 `current_basis_kind` 说明保护依据是否变化。待处理列表、补认历史、已归档反馈、
+  观测依据和序号都写入快照，保存重开后旧件历史、保护依据与原始反馈保持一致；
+  `record_attribution()` / `record_attribution_revoke()` 与
+  `replay_recording()` 支持完整回放。
 
 ## 测试配置
 
